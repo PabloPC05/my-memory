@@ -1,0 +1,167 @@
+# my-memory
+
+A self-hosted memory for AI agents. Your notes are a folder of Markdown files in git; my-memory serves them over [MCP](https://modelcontextprotocol.io) so any agent (Claude Code, Codex, claude.ai, your own bots) can search, read and write them. Every write is a git commit attributed to the client that made it.
+
+*[Leer en español](README.es.md)*
+
+- **Git is the source of truth.** Search runs on a SQLite index (catalog, FTS5 full text by section, wikilinks) that can be rebuilt from git at any time.
+- **One commit per write**, authored by the client: `Claude Code (laptop)`, `Alex (Claude)`…. The commit message is the reason the agent gave, plus `Client:` / `Tool:` / `Session:` trailers.
+- **Safe for several agents at once.** One writer queue, optimistic concurrency (`hash` from `read`), and pushes from elsewhere (your PC, Forgejo's web editor) integrated by rebase.
+- **Your conventions, not ours.** The notes repo declares its folders, required frontmatter and filename rules in `memory.toml`; its `AGENTS.md` is sent to every client as MCP instructions, with a short index.
+- **Two front doors.** A private listener for static per-client tokens, file uploads and the git webhook. A public listener that only accepts OAuth 2.1 tokens (dynamic client registration and PKCE, sign-in delegated to Forgejo) for remote clients like claude.ai.
+- **Attachments.** Binaries go to git LFS with a companion note holding their text (PDFs via `pdftotext`), so they are searchable too.
+- **Typed links.** `works_at:: [[acme]]` says what a link means, and `links` can filter by it.
+
+How it works inside (index, write flow, concurrency, auth): [docs/design.md](docs/design.md).
+
+## Tools
+
+| Tool | What it does |
+|---|---|
+| `list` | Short index, or every note in a folder with description, aliases and last change |
+| `search` | Full-text search by section (accents ignored, prefixes match) with snippets |
+| `read` | A note or one section, with its `hash`; `revision` reads an old version |
+| `links` | Outgoing `[[links]]` (broken ones included) and backlinks with context, optionally only one relation |
+| `history` | Commits that touched a note: who, when, why |
+| `create` | New note; unique names across folders; refuses look-alike duplicates unless `confirm_new` |
+| `edit` | Exact text replacements, all or nothing |
+| `write` | Rewrite a whole note; needs the `hash` you read |
+| `move` | Rename or move; rewrites every `[[link]]` to it in the same commit |
+| `delete` | Remove a note (it stays in history); refused while other notes link to it |
+| `attach` | Store a file in LFS with a searchable companion note |
+
+Clients with a read-only token only see the first five.
+
+## Notes format
+
+```markdown
+---
+name: Universidad
+description: Carrera, asignaturas de este curso y cómo las lleva
+aliases: [uni, carrera]
+---
+# Universidad
+
+Text, with links like [[otra-nota]], [[otra-nota#Sección|texto]] or ![[documento.pdf]].
+```
+
+File names (without `.md`) must be unique across the repo, so `[[name]]` always resolves; this is what Obsidian does with "shortest path" links.
+
+A link can also say what it means, with [Dataview](https://blacksmithgu.github.io/obsidian-dataview/)-style inline fields: `works_at:: [[acme]]` on its own line, `[lives_with:: [[sam]]]` inside a sentence, or `works_at: "[[acme]]"` in the frontmatter. `links` returns the relation and can filter by it, so "who works at Acme" is one call.
+
+`memory.toml` at the root of the notes repo (every key is optional):
+
+```toml
+[folders]
+allowed    = ["me", "people", "topics", "projects", "archive"]
+archive    = "archive"      # excluded from list/search unless asked
+index_full = ["me"]         # listed note by note in the short index
+root_files = ["AGENTS.md", "README.md"]
+
+[notes]
+required_fields  = ["name", "description"]
+filename_pattern = "^[a-z0-9]+(-[a-z0-9]+)*\\.md$"
+superseded_field = "superseded_by"
+max_description  = 200
+
+[instructions]
+file = "AGENTS.md"
+
+[attachments]
+page_heading = "Page {n}"
+
+[relations]
+allowed = ["works_at", "lives_with"]  # warn on other keys; without it, keys in use are suggested
+```
+
+## Running it
+
+Requirements: Node.js 24, git, git-lfs, and poppler's `pdftotext` (optional).
+
+```sh
+npm ci && npm run build
+my-memory token add laptop --name "Claude Code (laptop)" --scope write --file tokens.toml
+my-memory serve --config config.toml
+```
+
+`config.toml`:
+
+```toml
+data_dir = "/var/lib/my-memory"
+public_url = "https://memory.example.com"      # only with the public listener
+tokens_file = "tokens.toml"
+webhook_secret_file = "webhook-secret"          # paths, or credential:NAME for systemd credentials
+
+[remote]                                        # omit to keep the notes repo local
+url = "http://127.0.0.1:3000/me/notes.git"
+username = "my-memory"
+token_file = "forgejo-token"
+
+[listen.private]
+address = "127.0.0.1"
+port = 8782
+
+[listen.public]                                 # behind your TLS reverse proxy
+address = "127.0.0.1"
+port = 8781
+
+[oauth]                                         # required by the public listener
+forgejo_url = "https://git.example.com"         # as your browser reaches it
+forgejo_internal_url = "http://127.0.0.1:3000"  # as the server reaches it
+client_id_file = "oauth-client-id"              # an OAuth2 app registered in Forgejo,
+client_secret_file = "oauth-client-secret"      # redirect URI <public_url>/oauth/callback
+allowed_users = ["me"]
+```
+
+Uploads for `attach`: `curl -T file.pdf -H "Authorization: Bearer $TOKEN" http://host:8782/uploads/file.pdf` returns an `upload_id`. There is no size limit.
+
+### NixOS
+
+```nix
+{
+  inputs.my-memory.url = "github:<owner>/my-memory";
+  # in your configuration:
+  imports = [ inputs.my-memory.nixosModules.default ];
+  services.my-memory = {
+    enable = true;
+    remote = { url = "http://127.0.0.1:3000/me/notes.git"; tokenFile = "/run/secrets/forgejo-token"; };
+    listen.private = { address = "127.0.0.1"; port = 8782; };
+    tokensFile = "/var/lib/secrets/my-memory/tokens.toml";   # root:my-memory 0640
+  };
+}
+```
+
+After `my-memory token add … --file <tokensFile>`, run `systemctl reload my-memory`.
+
+### Connecting clients
+
+```sh
+# Claude Code
+claude mcp add --transport http memory http://host:8782/mcp --header "Authorization: Bearer $MY_MEMORY_TOKEN"
+```
+
+```toml
+# Codex (~/.codex/config.toml)
+[mcp_servers.memory]
+url = "http://host:8782/mcp"
+bearer_token_env_var = "MY_MEMORY_TOKEN"
+```
+
+claude.ai: Settings → Connectors → Add custom connector → `https://memory.example.com/mcp`.
+
+### Moving an existing repo to wikilinks
+
+`my-memory migrate <clone>` shows what would change: relative Markdown links become `[[wikilinks]]`, name collisions are renamed, and frontmatter that is not valid YAML gets quoted. Add `--apply` to commit it. Only those spans change.
+
+## Development
+
+```sh
+npm ci
+npm test          # vitest: unit, integration (real git repos) and HTTP/OAuth end to end
+npm run typecheck
+nix flake check   # builds the package and runs the NixOS VM test
+```
+
+## License
+
+Apache-2.0.
