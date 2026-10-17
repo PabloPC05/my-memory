@@ -4,6 +4,15 @@ Agents compare the `memory-setup <version>` line of the instructions they instal
 of [the guide](../agent-setup.md), and propose updates when this file lists a newer one. Bump the version only for
 changes an installed agent should act on.
 
+## 0.3.0 — 2026-10-17
+
+Skills travel with the memory, as in Notion's setup. Discovery lists the host's personal skills and checks
+whether the memory has a skills folder. The proposal can include importing eligible personal skills (never
+project, employer, organization or third-party ones unless the user picks them) into the folder `AGENTS.md`
+names, one note each, with their origin and supporting files. The persistent instructions gain a line to check
+the memory's skills at the start of a repeatable or multi-step task, and a standing rule says a skill never
+widens permissions. Installed agents: add that line to your block and bump the `memory-setup` marker to 0.3.0.
+
 ## 0.2.0 — 2026-10-17
 
 The link alone is enough: an agent given only this page sets up the memory without being told which connector
