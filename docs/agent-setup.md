@@ -12,7 +12,7 @@
 
 | Version | Published | Source |
 | - | - | - |
-| 0.3.1 ([changelog](agent-setup/changelog.md)) | October 17, 2026 | `https://raw.githubusercontent.com/PabloPC05/my-memory/main/docs/agent-setup.md` |
+| 0.3.2 ([changelog](agent-setup/changelog.md)) | October 17, 2026 | `https://raw.githubusercontent.com/PabloPC05/my-memory/main/docs/agent-setup.md` |
 
 Adapted from Notion's agent setup guide (v0.0.4, developers.notion.com/prompts/setup), with one addition
 Notion does not have: **enforcement**. Instructions only ask an agent to use the memory; where the host
@@ -160,7 +160,10 @@ one that fits, within what I have allowed. When I tell you something durable
 (a fact, decision and its reason, correction, preference, project state, useful research), save it there at
 once, updating the existing note instead of creating a near-duplicate. Do not save credentials, small talk,
 temporary progress, or what the repository already records. Never save durable knowledge in this host's own
-memory. If the memory server is unavailable, show me what you would have saved and say it is not saved.
+memory. When I ask to put something "in my memory" (or to keep, note or save it there), even a document, a list
+or a Markdown file, create it as a note in this memory, filed where AGENTS.md says (a project's material goes with
+that project); never as a local file unless I explicitly ask for a file. If the memory server is unavailable,
+show me what you would have saved and say it is not saved.
 
 memory-setup [version]
 ```
@@ -182,6 +185,13 @@ lands there.
     (copy it to `~/.claude/hooks/`; it also catches shell commands that write there, and tells the model where
     to save instead). Set `MEMORY_MCP_HINT` in the hook's environment, or edit the message in the file, to name
     the right tools.
+  - `hooks.UserPromptSubmit`: a hook running
+    [`agent-setup/claude-code/remind-memory.mjs`](agent-setup/claude-code/remind-memory.mjs) (copy it to
+    `~/.claude/hooks/`). When the user's message talks about saving or remembering something ("memory", "remember
+    this", "save it", "note this", and their Spanish equivalents; edit the pattern for other languages), it adds a
+    reminder to that turn: "memory" means this server, and a document asked for "in my memory" is a note there,
+    not a local file. Instructions alone were not enough: an agent asked for "a markdown in my memory" wrote a
+    local file. Set `MEMORY_MCP_HINT` as for the other hook.
   - After the import is verified: `"autoMemoryEnabled": false` (and `"autoDreamEnabled": false`), so Claude Code
     stops loading and asking to write its own memory.
   - The block from (a) goes in `~/.claude/CLAUDE.md`.
@@ -224,7 +234,10 @@ These apply after setup. `AGENTS.md` overrides them where they differ.
   is not there. Quote note names you actually read; never invent links.
 - **Write.** Save durable facts, decisions with their reasons, corrections, preferences, project state, useful
   research and plans another agent would need, at natural checkpoints, and always when the user says remember,
-  save, note or record. Update existing notes, whoever wrote them. `read` before `edit`/`write` and pass the
+  save, note or record. "My memory" means this memory: anything the user asks to keep there, including a document
+  or "a markdown", is a note here (notes are Markdown), never a local file unless they explicitly ask for one.
+  File it where `AGENTS.md` says; a project's material goes with that project, not in a general folder by
+  default. Update existing notes, whoever wrote them. `read` before `edit`/`write` and pass the
   hash; if it changed meanwhile, re-read and merge. Link people, topics and projects with `[[name]]`. Label
   inferences as such; only the user confirms their own decisions and preferences.
 - **Skills.** Before a task that is repeatable or has several steps, `search` or `list` the skills folder

@@ -4,6 +4,17 @@ Agents compare the `memory-setup <version>` line of the instructions they instal
 of [the guide](../agent-setup.md), and propose updates when this file lists a newer one. Bump the version only for
 changes an installed agent should act on.
 
+## 0.3.2 — 2026-10-17
+
+"In my memory" means this memory, even for documents. An agent asked for "a markdown with these questions, in my
+memory" wrote a local file instead of a note, and filed project material in a general folder. The persistent
+instructions and the Write rule now say that anything the user asks to keep in their memory, including a document
+or a Markdown file, is a note in this memory filed where `AGENTS.md` says (a project's material with that project),
+never a local file unless they ask for one. Claude Code gains a second hook, `remind-memory.mjs`
+(`UserPromptSubmit`), that adds this reminder to the turn whenever the user's message talks about saving or
+remembering. Installed agents: add the sentence to your block, install the hook on Claude Code, and bump the
+`memory-setup` marker to 0.3.2.
+
 ## 0.3.1 — 2026-10-17
 
 Discovery checks the agent's identity: if the server offers a `clients` tool, the agent looks at it and, when
