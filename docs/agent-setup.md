@@ -12,7 +12,7 @@
 
 | Version | Published | Source |
 | - | - | - |
-| 0.3.0 ([changelog](agent-setup/changelog.md)) | October 17, 2026 | `https://raw.githubusercontent.com/PabloPC05/my-memory/main/docs/agent-setup.md` |
+| 0.3.1 ([changelog](agent-setup/changelog.md)) | October 17, 2026 | `https://raw.githubusercontent.com/PabloPC05/my-memory/main/docs/agent-setup.md` |
 
 Adapted from Notion's agent setup guide (v0.0.4, developers.notion.com/prompts/setup), with one addition
 Notion does not have: **enforcement**. Instructions only ask an agent to use the memory; where the host
@@ -74,6 +74,10 @@ memory. Where it and this page disagree, it wins. Read it before step 1.
   `~/.claude/skills/<name>/SKILL.md` folder), where they live, and for each one its name, description,
   origin (written by the user, or installed from a repository, a project, an employer or a third party),
   supporting files and size. Only list them; do not open more than their headers.
+- **Your identity.** If the server offers a `clients` tool, call it. Check that your writes will be
+  attributed to an identity of your own: not a gateway's name, and not a name other agents also use. If
+  they would not be, say so in the proposal and recommend that the user give this agent its own credential
+  (one token or key per agent). Do not block setup because of it.
 - **The memory.** `list` the index and `search` for the user's main topics, so you know what is already there.
   Look for an existing install record for this host (`search` for "agent setup" or the host name). See whether
   `AGENTS.md` names a skills folder and whether it already holds skills (`list` it).
