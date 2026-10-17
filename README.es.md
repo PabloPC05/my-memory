@@ -5,7 +5,7 @@ Una memoria autoalojada para agentes de IA. Tus notas son una carpeta de Markdow
 *[Read in English](README.md)*
 
 - **Git es la fuente de verdad.** La búsqueda va sobre un índice SQLite (catálogo, texto completo FTS5 por secciones y wikilinks) que se reconstruye desde git cuando haga falta.
-- **Un commit por escritura**, con el cliente como autor. El mensaje es el motivo que da el agente, con trailers `Client:`, `Tool:` y `Session:`.
+- **Un commit por escritura**, con el cliente como autor. El mensaje es el motivo que da el agente, con trailers `Client:`, `Tool:` y `Session:`. `recent` muestra qué ha cambiado y `revert` lo deshace con un commit nuevo.
 - **Varios agentes a la vez.** Las escrituras van en cola, se usa concurrencia optimista (el `hash` de `read`) y los pushes de fuera se integran con rebase.
 - **Tus convenciones.** El repo de notas declara sus carpetas, su frontmatter obligatorio y su patrón de nombres en `memory.toml`. Su `AGENTS.md` llega a todos los clientes como instrucciones MCP, junto con un índice corto.
 - **Dos puertas de entrada.**

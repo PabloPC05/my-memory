@@ -5,7 +5,7 @@ A self-hosted memory for AI agents. Your notes are a folder of Markdown files in
 *[Leer en español](README.es.md)*
 
 - **Git is the source of truth.** Search runs on a SQLite index (catalog, FTS5 full text by section, wikilinks) that can be rebuilt from git at any time.
-- **One commit per write**, authored by the client: `Claude Code (laptop)`, `Alex (Claude)`…. The commit message is the reason the agent gave, plus `Client:` / `Tool:` / `Session:` trailers.
+- **One commit per write**, authored by the client: `Claude Code (laptop)`, `Alex (Claude)`…. The commit message is the reason the agent gave, plus `Client:` / `Tool:` / `Session:` trailers. `recent` shows what changed and `revert` undoes it.
 - **Safe for several agents at once.** One writer queue, optimistic concurrency (`hash` from `read`), and pushes from elsewhere (your PC, Forgejo's web editor) integrated by rebase.
 - **Your conventions, not ours.** The notes repo declares its folders, required frontmatter and filename rules in `memory.toml`; its `AGENTS.md` is sent to every client as MCP instructions, with a short index.
 - **Two front doors.** A private listener for static per-client tokens, file uploads and the git webhook. A public listener that only accepts OAuth 2.1 tokens (dynamic client registration and PKCE, sign-in delegated to Forgejo) for remote clients like claude.ai.
@@ -23,14 +23,16 @@ How it works inside (index, write flow, concurrency, auth): [docs/design.md](doc
 | `read` | A note or one section, with its `hash`; `revision` reads an old version |
 | `links` | Outgoing `[[links]]` (broken ones included) and backlinks with context, optionally only one relation |
 | `history` | Commits that touched a note: who, when, why |
+| `recent` | Commits across the whole memory with the files each one changed; filter by date, by "after this commit" or by folder |
 | `create` | New note; unique names across folders; refuses look-alike duplicates unless `confirm_new` |
 | `edit` | Exact text replacements, all or nothing |
 | `write` | Rewrite a whole note; needs the `hash` you read |
 | `move` | Rename or move; rewrites every `[[link]]` to it in the same commit |
 | `delete` | Remove a note (it stays in history); refused while other notes link to it |
 | `attach` | Store a file in LFS with a searchable companion note |
+| `revert` | Undo an earlier commit with a new one; reports conflicts with later commits instead of guessing |
 
-Clients with a read-only token only see the first five.
+Clients with a read-only token only see the first six.
 
 ## Notes format
 
