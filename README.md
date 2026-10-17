@@ -11,7 +11,7 @@ A self-hosted memory for AI agents. Your notes are a folder of Markdown files in
 - **Safe for several agents at once.** One writer queue, optimistic concurrency (`hash` from `read`), and pushes from elsewhere (your PC, Forgejo's web editor) integrated by rebase.
 - **Your conventions, not ours.** The notes repo declares its folders, required frontmatter and filename rules in `memory.toml`; its `AGENTS.md` is sent to every client as MCP instructions, with a short index.
 - **Two front doors.** A private listener for static per-client tokens, file uploads and the git webhook. A public listener that only accepts OAuth 2.1 tokens (dynamic client registration and PKCE, sign-in delegated to Forgejo) for remote clients like claude.ai.
-- **Attachments.** Binaries go to git LFS with a companion note holding their text (PDFs via `pdftotext`), so they are searchable too.
+- **Attachments.** Binaries go to git LFS with a companion note holding their text (PDFs via `pdftotext`; scanned PDFs and images via local OCR with `tesseract`, when installed), so they are searchable too.
 - **Typed links.** `works_at:: [[acme]]` says what a link means, and `links` can filter by it.
 
 How it works inside (index, write flow, concurrency, auth): [docs/design.md](docs/design.md).
@@ -86,6 +86,7 @@ file = "AGENTS.md"
 
 [attachments]
 page_heading = "Page {n}"
+ocr_notice   = "Text recognised with OCR ({languages}); it may contain errors."
 
 [relations]
 allowed = ["works_at", "lives_with"]  # warn on other keys; without it, keys in use are suggested
@@ -93,7 +94,7 @@ allowed = ["works_at", "lives_with"]  # warn on other keys; without it, keys in 
 
 ## Running it
 
-Requirements: Node.js 24, git, git-lfs, and poppler's `pdftotext` (optional).
+Requirements: Node.js 24, git, git-lfs, and optionally poppler-utils (`pdftotext` for PDF text, `pdftoppm` for OCR of scans) and `tesseract` with the language data you want (for OCR of scanned PDFs and images). Missing tools are reported at startup (`ocr.tools` in the log) and only make that extraction unavailable.
 
 ```sh
 npm ci && npm run build
@@ -131,6 +132,13 @@ forgejo_internal_url = "http://127.0.0.1:3000"  # as the server reaches it
 client_id_file = "oauth-client-id"              # an OAuth2 app registered in Forgejo,
 client_secret_file = "oauth-client-secret"      # redirect URI <public_url>/oauth/callback
 allowed_users = ["me"]
+
+[ocr]                                           # every key is optional
+enabled = true
+languages = "spa+eng"                           # tesseract language codes; default "eng"
+max_pages = 50                                  # pages of a scanned PDF that are OCR'd
+page_timeout_seconds = 120                      # per page (render + recognition) or image
+# dpi = 300; tesseract = "tesseract"; pdftoppm = "pdftoppm"
 ```
 
 Uploads for `attach`: `curl -T file.pdf -H "Authorization: Bearer $TOKEN" http://host:8782/uploads/file.pdf` returns an `upload_id`. There is no size limit.
@@ -147,11 +155,12 @@ Uploads for `attach`: `curl -T file.pdf -H "Authorization: Bearer $TOKEN" http:/
     remote = { url = "http://127.0.0.1:3000/me/notes.git"; tokenFile = "/run/secrets/forgejo-token"; };
     listen.private = { address = "127.0.0.1"; port = 8782; };
     tokensFile = "/var/lib/secrets/my-memory/tokens.toml";   # root:my-memory 0640
+    # ocr = { enable = true; languages = [ "spa" "eng" ]; maxPages = 50; pageTimeoutSeconds = 120; };
   };
 }
 ```
 
-After `my-memory token add … --file <tokensFile>`, run `systemctl reload my-memory`.
+After `my-memory token add … --file <tokensFile>`, run `systemctl reload my-memory`. The package brings pdftotext, pdftoppm and tesseract; the module installs the language data listed in `ocr.languages` (default Spanish and English).
 
 ### Connecting clients
 

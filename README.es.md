@@ -11,7 +11,7 @@ Una memoria autoalojada para agentes de IA. Tus notas son una carpeta de Markdow
 - **Seguro con varios agentes a la vez.** Una sola cola de escritura, concurrencia optimista (el `hash` de `read`) y los pushes de fuera (tu PC, el editor web de Forgejo) se integran con rebase.
 - **Tus convenciones, no las nuestras.** El repo de notas declara sus carpetas, su frontmatter obligatorio y sus reglas de nombres en `memory.toml`; su `AGENTS.md` llega a todos los clientes como instrucciones MCP, junto con un índice corto.
 - **Dos puertas de entrada.** Un listener privado para tokens fijos por cliente, subida de archivos y el webhook de git. Un listener público que solo acepta tokens OAuth 2.1 (registro dinámico de clientes y PKCE, con el inicio de sesión delegado en Forgejo) para clientes remotos como claude.ai.
-- **Adjuntos.** Los binarios van a git LFS con una nota al lado que contiene su texto (los PDF, con `pdftotext`), así que también se encuentran al buscar.
+- **Adjuntos.** Los binarios van a git LFS con una nota al lado que contiene su texto (los PDF, con `pdftotext`; los PDF escaneados y las imágenes, con OCR local mediante `tesseract` si está instalado), así que también se encuentran al buscar.
 - **Enlaces con tipo.** `works_at:: [[acme]]` dice qué significa un enlace, y `links` puede filtrar por él.
 
 Cómo funciona por dentro (índice, flujo de escritura, concurrencia, autenticación): [docs/design.md](docs/design.md).
@@ -86,6 +86,7 @@ file = "AGENTS.md"
 
 [attachments]
 page_heading = "Page {n}"
+ocr_notice   = "Text recognised with OCR ({languages}); it may contain errors."
 
 [relations]
 allowed = ["works_at", "lives_with"]  # avisa con otras claves; sin esto, se sugieren las que estén en uso
@@ -93,7 +94,7 @@ allowed = ["works_at", "lives_with"]  # avisa con otras claves; sin esto, se sug
 
 ## Ponerlo en marcha
 
-Requisitos: Node.js 24, git, git-lfs y `pdftotext` de poppler (opcional).
+Requisitos: Node.js 24, git, git-lfs y, de forma opcional, poppler-utils (`pdftotext` para el texto de los PDF y `pdftoppm` para el OCR de escaneos) y `tesseract` con los idiomas que quieras (para el OCR de PDF escaneados e imágenes). Al arrancar se registra qué herramientas hay (`ocr.tools` en el log); si falta alguna, solo deja de estar disponible esa extracción.
 
 ```sh
 npm ci && npm run build
@@ -131,6 +132,13 @@ forgejo_internal_url = "http://127.0.0.1:3000"  # como lo ve el servidor
 client_id_file = "oauth-client-id"              # una app OAuth2 registrada en Forgejo,
 client_secret_file = "oauth-client-secret"      # URI de redirección <public_url>/oauth/callback
 allowed_users = ["me"]
+
+[ocr]                                           # todas las claves son opcionales
+enabled = true
+languages = "spa+eng"                           # códigos de idioma de tesseract; por defecto "eng"
+max_pages = 50                                  # páginas de un PDF escaneado que pasan por OCR
+page_timeout_seconds = 120                      # por página (render + reconocimiento) o imagen
+# dpi = 300; tesseract = "tesseract"; pdftoppm = "pdftoppm"
 ```
 
 Subidas para `attach`: `curl -T file.pdf -H "Authorization: Bearer $TOKEN" http://host:8782/uploads/file.pdf` devuelve un `upload_id`. No hay límite de tamaño.
@@ -147,11 +155,12 @@ Subidas para `attach`: `curl -T file.pdf -H "Authorization: Bearer $TOKEN" http:
     remote = { url = "http://127.0.0.1:3000/me/notes.git"; tokenFile = "/run/secrets/forgejo-token"; };
     listen.private = { address = "127.0.0.1"; port = 8782; };
     tokensFile = "/var/lib/secrets/my-memory/tokens.toml";   # root:my-memory 0640
+    # ocr = { enable = true; languages = [ "spa" "eng" ]; maxPages = 50; pageTimeoutSeconds = 120; };
   };
 }
 ```
 
-Tras `my-memory token add … --file <tokensFile>`, ejecuta `systemctl reload my-memory`.
+Tras `my-memory token add … --file <tokensFile>`, ejecuta `systemctl reload my-memory`. El paquete trae pdftotext, pdftoppm y tesseract; el módulo instala los datos de los idiomas de `ocr.languages` (por defecto español e inglés).
 
 ### Conectar clientes
 
