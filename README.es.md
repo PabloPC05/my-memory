@@ -16,4 +16,14 @@ Una memoria autoalojada para agentes de IA. Tus notas son una carpeta de Markdow
 
 Las herramientas, la configuración, el módulo de NixOS y cómo conectar cada cliente están en el [README en inglés](README.md); cómo funciona por dentro, en [docs/design.md](docs/design.md).
 
+## Dale a tu agente un enlace
+
+Con el servidor ya conectado al agente, mándale esto y nada más:
+
+```text
+https://raw.githubusercontent.com/PabloPC05/my-memory/main/docs/agent-setup.md
+```
+
+El agente lee [la guía de instalación](docs/agent-setup.md) y se instala la memoria él solo: la encuentra entre sus herramientas, te propone importar lo que ya sabe de ti, instala sus instrucciones permanentes y, donde la plataforma lo permite (Claude Code, tus propios agentes), le impide guardar en otro sitio. Te pide un único permiso antes de cambiar nada. Inspirado en la página de instalación para agentes de Notion.
+
 Licencia Apache-2.0.
