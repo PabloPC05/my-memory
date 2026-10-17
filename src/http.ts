@@ -6,6 +6,7 @@ import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { ForgejoOAuthProvider } from "./auth/oauth.js";
 import type { TokenStore } from "./auth/tokens.js";
+import type { ClientsService } from "./clients.js";
 import type { Logger } from "./log.js";
 import type { ClientIdentity, MemoryService } from "./memory.js";
 import { createMcpServer, SERVER_NAME } from "./tools.js";
@@ -21,14 +22,32 @@ export function identityFrom(req: Request): ClientIdentity {
 	return { id: `oauth:${auth.clientId}`, name: `${extra.user ?? "OAuth user"} (${extra.clientName ?? "OAuth client"})`, scope: auth.scopes.includes("write") ? "write" : "read", session };
 }
 
-function mcpHandler(memory: MemoryService, log: Logger) {
+/** Names of the tools called in a JSON-RPC body (one message or a batch); null entries for other requests. */
+export function toolCalls(body: unknown): (string | null)[] {
+	const messages = Array.isArray(body) ? body : [body];
+	return messages
+		.filter((m): m is Record<string, unknown> => typeof m === "object" && m !== null && typeof (m as { method?: unknown }).method === "string")
+		.map((m) => {
+			const name = (m.params as { name?: unknown } | undefined)?.name;
+			return m.method === "tools/call" && typeof name === "string" ? name.slice(0, 64) : null;
+		});
+}
+
+function mcpHandler(memory: MemoryService, log: Logger, clients: ClientsService | null) {
 	return async (req: Request, res: Response) => {
 		if (req.method !== "POST") {
 			res.status(405).set("Allow", "POST").json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed: this server is stateless, use POST." }, id: null });
 			return;
 		}
 		const client = identityFrom(req);
-		const server = await createMcpServer(memory, client, log);
+		if (clients) {
+			try {
+				for (const tool of toolCalls(req.body)) clients.record(client, tool);
+			} catch (error) {
+				log("warn", "clients.record_failed", { error: String(error) });
+			}
+		}
+		const server = await createMcpServer(memory, client, log, clients);
 		const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
 		res.on("close", () => {
 			transport.close().catch(() => undefined);
@@ -56,7 +75,7 @@ function errorHandler(log: Logger) {
  * Public listener (behind the public reverse proxy): OAuth endpoints and MCP with OAuth access tokens only.
  * Static tokens are never accepted here, so a leaked one is useless from the internet.
  */
-export function publicApp(opts: { memory: MemoryService; oauth: ForgejoOAuthProvider; publicUrl: string; log: Logger }): express.Express {
+export function publicApp(opts: { memory: MemoryService; oauth: ForgejoOAuthProvider; publicUrl: string; log: Logger; clients?: ClientsService | null }): express.Express {
 	const app = express();
 	app.disable("x-powered-by");
 	app.set("trust proxy", "loopback");
@@ -76,7 +95,7 @@ export function publicApp(opts: { memory: MemoryService; oauth: ForgejoOAuthProv
 		}),
 	);
 	app.get("/oauth/callback", asyncRoute(opts.oauth.callback));
-	app.all("/mcp", requireBearerAuth({ verifier: opts.oauth, resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resource) }), express.json({ limit: "64mb" }), asyncRoute(mcpHandler(opts.memory, opts.log)));
+	app.all("/mcp", requireBearerAuth({ verifier: opts.oauth, resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resource) }), express.json({ limit: "64mb" }), asyncRoute(mcpHandler(opts.memory, opts.log, opts.clients ?? null)));
 	app.use((_req, res) => {
 		res.status(404).json({ error: "not_found" });
 	});
@@ -87,7 +106,7 @@ export function publicApp(opts: { memory: MemoryService; oauth: ForgejoOAuthProv
 /**
  * Private listener (tailnet only): MCP with static tokens (or OAuth ones), uploads and the Forgejo webhook.
  */
-export function privateApp(opts: { memory: MemoryService; tokens: TokenStore; oauth?: ForgejoOAuthProvider | null; uploads: UploadStore; webhookSecret?: string | null; log: Logger }): express.Express {
+export function privateApp(opts: { memory: MemoryService; tokens: TokenStore; oauth?: ForgejoOAuthProvider | null; uploads: UploadStore; webhookSecret?: string | null; log: Logger; clients?: ClientsService | null }): express.Express {
 	const app = express();
 	app.disable("x-powered-by");
 
@@ -160,7 +179,7 @@ export function privateApp(opts: { memory: MemoryService; tokens: TokenStore; oa
 		}),
 	);
 
-	app.all("/mcp", authenticated, express.json({ limit: "512mb" }), asyncRoute(mcpHandler(opts.memory, opts.log)));
+	app.all("/mcp", authenticated, express.json({ limit: "512mb" }), asyncRoute(mcpHandler(opts.memory, opts.log, opts.clients ?? null)));
 	app.use((_req, res) => {
 		res.status(404).json({ error: "not_found" });
 	});

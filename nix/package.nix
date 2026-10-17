@@ -21,6 +21,7 @@ buildNpmPackage {
       ../tsconfig.build.json
       ../src
       ../bin
+      ../docs/agent-setup.md
     ];
   };
 

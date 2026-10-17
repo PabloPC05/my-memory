@@ -12,7 +12,8 @@
   },
   "files": [
     "bin",
-    "dist"
+    "dist",
+    "docs/agent-setup.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

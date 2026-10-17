@@ -11,6 +11,7 @@ import { Git } from "./git.js";
 import { type Logger, silentLogger } from "./log.js";
 import { firstH1, rewriteWikiLinks, splitSections } from "./markdown.js";
 import { parseTypedLinks } from "./relations.js";
+import { SETUP_GUIDE_URI, SETUP_GUIDE_URL } from "./setup-guide.js";
 import { buildFtsQuery, type NoteRow, SearchIndex } from "./search-index.js";
 import type { UploadStore } from "./uploads.js";
 import {
@@ -721,6 +722,7 @@ export class MemoryService {
 	async instructions(): Promise<string> {
 		const parts = [
 			"This server is a shared, git-versioned memory of Markdown notes. Every write is a commit attributed to you; give a one-line `reason` in the user's language. Search before creating notes; read a note before rewriting it and pass back its `hash`. Link notes with [[name]]. To say how two notes relate, write the link as a field, `key:: [[name]]` on its own line or `[key:: [[name]]]` inside a sentence; `links` can then filter by that key.",
+			`If this host is not set up to use this memory yet, follow the \`setup\` prompt or the \`${SETUP_GUIDE_URI}\` resource (or ${SETUP_GUIDE_URL}).`,
 		];
 		const allowed = this.conventions.relations.allowed;
 		const inUse = this.index.relations().map((r) => r.relation);
