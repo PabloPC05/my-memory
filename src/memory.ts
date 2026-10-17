@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
-import { copyFile, lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { stringify as stringifyYaml } from "yaml";
@@ -10,7 +11,7 @@ import { extractAttachment, type Extraction } from "./extract.js";
 import { parseNote, splitFrontmatter } from "./frontmatter.js";
 import { Git } from "./git.js";
 import { type Logger, silentLogger } from "./log.js";
-import { firstH1, rewriteWikiLinks, splitSections } from "./markdown.js";
+import { firstH1, rewriteWikiLinks, splitSections, targetNameOf } from "./markdown.js";
 import type { OcrRunner } from "./ocr.js";
 import { parseTypedLinks } from "./relations.js";
 import { SETUP_GUIDE_URI, SETUP_GUIDE_URL } from "./setup-guide.js";
@@ -21,12 +22,15 @@ import {
 	checkNewFilename,
 	checkPath,
 	dirOf,
+	type FileChange,
 	joinPath,
 	levenshtein,
 	looksLikeSame,
 	Mutex,
 	normalizeWords,
 	noteName,
+	parseNameStatus,
+	parseSince,
 	sha256,
 	topFolder,
 } from "./util.js";
@@ -88,6 +92,24 @@ export interface WriteResult {
 type NoteRef = { path?: string; name?: string };
 
 const READ_ONLY = new MemoryError("FORBIDDEN", "This client has read-only access.");
+
+/** git's empty tree: the "parent" of a root commit. */
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/** One commit as `recent` returns it. */
+export interface RecentCommit {
+	commit: string;
+	date: string;
+	author: string;
+	client: string | null;
+	tool: string | null;
+	session?: string;
+	reverts?: string;
+	reason: string;
+	notes: { path: string; name?: string; change: "added" | "modified" | "deleted" | "moved" | "copied"; from?: string }[];
+}
+
+const CHANGE_NAMES: Record<string, RecentCommit["notes"][number]["change"]> = { A: "added", M: "modified", T: "modified", D: "deleted", R: "moved", C: "copied" };
 
 /**
  * The memory: a git working clone of the notes repo plus its derived index.
@@ -635,9 +657,10 @@ export class MemoryService {
 		if (hash !== now) throw new MemoryError("CONFLICT", `«${path}» changed since you read it.`, { path, hash: now, content: current });
 	}
 
-	private commitMessage(client: ClientIdentity, tool: string, reason: string): string {
+	private commitMessage(client: ClientIdentity, tool: string, reason: string, extra: Record<string, string> = {}): string {
 		const trailers = [`Client: ${client.id}`, `Tool: ${tool}`];
 		if (client.session) trailers.push(`Session: ${client.session.replace(/\s+/g, " ").slice(0, 200)}`);
+		for (const [key, value] of Object.entries(extra)) trailers.push(`${key}: ${value}`);
 		return `${reason}\n\n${trailers.join("\n")}\n`;
 	}
 
@@ -654,7 +677,7 @@ export class MemoryService {
 		client: ClientIdentity,
 		tool: string,
 		rawReason: unknown,
-		apply: () => Promise<{ paths: string[]; result: { path: string; [k: string]: unknown }; warnings?: Warning[]; contentPath?: string }>,
+		apply: () => Promise<{ paths: string[]; result: { path: string; [k: string]: unknown }; warnings?: Warning[]; contentPath?: string; trailers?: Record<string, string> }>,
 	): Promise<WriteResult> {
 		if (client.scope !== "write") return Promise.reject(READ_ONLY);
 		let reason: string;
@@ -677,7 +700,7 @@ export class MemoryService {
 					const hash = (await this.exists(contentPath)) ? blobHash(await this.readText(contentPath)) : null;
 					return { commit: before, hash, ...applied.result, warnings: [...(applied.warnings ?? []), { code: "NO_CHANGES" as const, message: "Nothing changed; no commit was made." }] };
 				}
-				await this.git.run(["commit", "-q", "--no-verify", "-F", "-"], { input: this.commitMessage(client, tool, reason), env: this.authorEnv(client) });
+				await this.git.run(["commit", "-q", "--no-verify", "-F", "-"], { input: this.commitMessage(client, tool, reason, applied.trailers), env: this.authorEnv(client) });
 			} catch (error) {
 				await this.restoreWorktree(before).catch((e) => this.log("error", "worktree.restore_failed", { error: String(e) }));
 				throw error;
@@ -950,6 +973,72 @@ export class MemoryService {
 		return { path, commits };
 	}
 
+	/**
+	 * The latest commits on the branch, newest first, with the files each one touched.
+	 * Files only in the archive are left out (and commits that touched nothing else) unless include_archive.
+	 */
+	async recent(args: { limit?: number; since?: string; folder?: string; client?: string; include_archive?: boolean }): Promise<{ commits: RecentCommit[]; since?: string }> {
+		const limit = Math.min(Math.max(args.limit ?? 20, 1), 200);
+		const since = args.since?.trim() ? parseSince(args.since) : null;
+		const folder = args.folder ? args.folder.trim().replace(/^\.\/|\/+$/g, "") : null;
+		if (folder !== null && (folder === "" || folder.startsWith("-") || folder.split("/").some((p) => p === "" || p.startsWith(".")))) {
+			throw new MemoryError("INVALID_ARGUMENT", `Invalid folder «${args.folder}».`);
+		}
+		const archive = this.conventions.folders.archive;
+		const includeArchive = args.include_archive ?? (folder !== null && folder === archive);
+		const hidden = (p: string) => !includeArchive && archive !== null && topFolder(p) === archive;
+		const client = args.client?.trim().toLowerCase() || null;
+		if (!(await this.git.head())) return { commits: [] };
+		const commits: RecentCommit[] = [];
+		// Filters that drop commits after git has listed them read the log in pages.
+		const page = client || since || !includeArchive ? Math.max(limit * 4, 100) : limit;
+		for (let skip = 0; commits.length < limit; skip += page) {
+			const out = await this.git.out([
+				"log",
+				`-n${page}`,
+				`--skip=${skip}`,
+				"-M",
+				"--name-status",
+				"--format=%x1e%H%x1f%aI%x1f%an%x1f%s%x1f%(trailers:only=true,unfold=true)%x1f",
+				...(since ? [`--since=${since}`] : []),
+				...(folder ? ["--full-diff", "--", `${folder}/`] : []),
+			]);
+			const blocks = out.split("\x1e").filter((b) => b.trim());
+			for (const block of blocks) {
+				const [commit, date, author, reason, trailerText, files] = block.split("\x1f") as string[];
+				const trailers: Record<string, string> = {};
+				for (const line of (trailerText ?? "").split("\n")) {
+					const m = /^([\w-]+):\s*(.*)$/.exec(line.trim());
+					if (m) trailers[m[1] as string] = m[2] as string;
+				}
+				if (client && trailers.Client?.toLowerCase() !== client && author?.toLowerCase() !== client) continue;
+				if (since && Date.parse(date as string) < Date.parse(since)) continue; // git's --since is a hint, not exact
+				const changes = parseNameStatus(files ?? "");
+				const visible = changes.filter((c) => !hidden(c.path) || (c.from !== undefined && !hidden(c.from)));
+				if (changes.length > 0 && visible.length === 0) continue;
+				commits.push({
+					commit: commit as string,
+					date: date as string,
+					author: author as string,
+					client: trailers.Client ?? null,
+					tool: trailers.Tool ?? null,
+					...(trailers.Session ? { session: trailers.Session } : {}),
+					...(trailers.Reverts ? { reverts: trailers.Reverts } : {}),
+					reason: reason as string,
+					notes: visible.map((c) => ({
+						path: c.path,
+						...(/\.md$/i.test(c.path) ? { name: noteName(c.path) } : {}),
+						change: CHANGE_NAMES[c.status] ?? "modified",
+						...(c.from ? { from: c.from } : {}),
+					})),
+				});
+				if (commits.length === limit) break;
+			}
+			if (blocks.length < page) break;
+		}
+		return { commits, ...(since ? { since } : {}) };
+	}
+
 	// ── write tools ──────────────────────────────────────────────────────────
 
 	create(client: ClientIdentity, args: { path: string; content: string; reason: string; confirm_new?: boolean }): Promise<WriteResult> {
@@ -1101,6 +1190,184 @@ export class MemoryService {
 			}
 			return { paths, result: { path: row.path } };
 		});
+	}
+
+	/** Full hash of a commit given by a client, which must be on the current branch. */
+	private async branchCommit(input: unknown): Promise<string> {
+		const rev = typeof input === "string" ? input.trim() : "";
+		if (!rev) throw new MemoryError("INVALID_ARGUMENT", "«commit» is required: a hash from `recent` or `history`.");
+		if (!/^[\w./~^@{}-]+$/.test(rev) || rev.startsWith("-") || !(await this.git.exists(rev))) throw new MemoryError("INVALID_REVISION", `Unknown commit «${rev}».`);
+		const full = (await this.git.out(["rev-parse", "--verify", `${rev}^{commit}`])).trim();
+		const onBranch = (await this.git.run(["merge-base", "--is-ancestor", full, "HEAD"], { allowFail: true })).code === 0;
+		if (!onBranch) throw new MemoryError("INVALID_REVISION", `Commit «${rev}» is not part of the memory's history (branch ${this.branch}).`);
+		return full;
+	}
+
+	/** Blob id of a file at a revision, or null when it does not exist there. */
+	private async blobAt(rev: string, path: string): Promise<string | null> {
+		const r = await this.git.run(["rev-parse", "-q", "--verify", `${rev}:${path}`], { allowFail: true });
+		return r.code === 0 ? r.stdout.trim() : null;
+	}
+
+	private async blobText(id: string): Promise<string> {
+		return this.git.out(["cat-file", "blob", id]);
+	}
+
+	/** Three-way merge of text (`git merge-file`): the result, or null when the changes overlap. */
+	private async mergeText(ours: string, base: string, theirs: string): Promise<string | null> {
+		const dir = await mkdtemp(join(tmpdir(), "mm-merge-"));
+		try {
+			const files = ["ours", "base", "theirs"].map((f) => join(dir, f));
+			await Promise.all([ours, base, theirs].map((text, i) => writeFile(files[i] as string, text, "utf8")));
+			const r = await this.git.run(["merge-file", "-p", "-q", ...files], { allowFail: true });
+			return r.code === 0 ? r.stdout : null;
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	}
+
+	/**
+	 * Undoes a commit, or only what it did to one note: every file it touched goes back to its state before it,
+	 * as one new commit. Later changes to the same files are kept when they do not overlap (three-way merge);
+	 * otherwise nothing is changed and it fails with REVERT_CONFLICT. Binaries are never rewritten from history:
+	 * they can be removed (undoing an attach) or moved back, but not restored. `.gitattributes` is left alone.
+	 */
+	revert(client: ClientIdentity, args: NoteRef & { commit: string; reason: string }): Promise<WriteResult> {
+		return this.mutate(
+			client,
+			"revert",
+			args.reason,
+			async () => {
+				const target = await this.branchCommit(args.commit);
+				const short = target.slice(0, 12);
+				const parents = (await this.git.out(["rev-list", "--parents", "-n1", target])).trim().split(" ").slice(1);
+				if (parents.length > 1) throw new MemoryError("INVALID_REVISION", `«${short}» is a merge commit; revert the commits it brought in instead.`);
+				const base = parents[0] ?? EMPTY_TREE;
+				let changes: FileChange[] = parseNameStatus(await this.git.out(["diff", "-M", "--name-status", base, target])).filter((c) => c.path !== ".gitattributes" && c.from !== ".gitattributes");
+				let only: string | null = null;
+				if ((args.path ?? "").trim() || (args.name ?? "").trim()) {
+					if ((args.path ?? "").trim() && (args.name ?? "").trim()) throw new MemoryError("INVALID_ARGUMENT", "Give either «path» or «name», not both.");
+					const wanted = args.path?.trim() ? checkPath(args.path, this.conventions, "note") : null;
+					const key = wanted ? null : targetNameOf((args.name as string).trim().replace(/^!?\[\[|\]\]$/g, "").replace(/[#|].*$/, ""));
+					const matches = (p: string | undefined) => p !== undefined && /\.md$/i.test(p) && (wanted ? p === wanted : targetNameOf(p) === key);
+					changes = changes.filter((c) => matches(c.path) || matches(c.from));
+					if (changes.length === 0) throw new MemoryError("NOT_FOUND", `Commit ${short} did not touch «${args.path ?? args.name}».`);
+					if (changes.length > 1) throw new MemoryError("INVALID_ARGUMENT", `Several notes in ${short} match «${args.name}»; use «path».`, { paths: changes.map((c) => c.path) });
+					only = changes[0]?.path ?? null;
+				}
+				if (changes.length === 0) throw new MemoryError("NOT_RESTORABLE", `Commit ${short} changed nothing that can be reverted.`);
+
+				const isText = (p: string) => /\.md$/i.test(p) || !p.includes("/");
+				const notRestorable = (p: string) =>
+					new MemoryError("NOT_RESTORABLE", `«${p}» is a binary attachment; revert cannot bring its old content back. Attach the file again${only ? "" : ", or revert only the note with «path»"}.`, { path: p });
+				const conflict = async (p: string, why: string) => {
+					const later = (await this.git.out(["log", "--format=%H %s", `${target}..HEAD`, "--", p])).trim().split("\n").filter(Boolean);
+					return new MemoryError("REVERT_CONFLICT", `«${p}» ${why} since ${short}; nothing was reverted. Change it by hand instead.`, {
+						path: p,
+						later_commits: later.map((l) => ({ commit: l.slice(0, 40), message: l.slice(41) })),
+					});
+				};
+				/** Old text back on top of the current one, keeping later changes that do not overlap. */
+				const restoreText = async (p: string, now: string, was: string, old: string) => {
+					if (now === was) return this.blobText(old);
+					const merged = await this.mergeText(await this.blobText(now), await this.blobText(was), await this.blobText(old));
+					if (merged === null) throw await conflict(p, "was changed again where this commit changed it");
+					return merged;
+				};
+
+				const writes = new Map<string, string>();
+				const removes = new Set<string>();
+				const renames: { from: string; to: string }[] = [];
+				const created = new Set<string>(); // paths that do not exist now and the revert brings back
+				const summary: { path: string; change: "restored" | "removed" | "reverted" | "moved_back"; from?: string }[] = [];
+				for (const c of changes) {
+					const now = await this.blobAt("HEAD", c.path);
+					const was = await this.blobAt(target, c.path);
+					if (c.status === "A" || c.status === "C") {
+						if (now === null) continue; // already gone
+						if (now !== was) throw await conflict(c.path, "was changed");
+						removes.add(c.path);
+						summary.push({ path: c.path, change: "removed" });
+					} else if (c.status === "D") {
+						const old = (await this.blobAt(base, c.path)) as string;
+						if (now === old) continue; // already back
+						if (now !== null) throw await conflict(c.path, "was created again");
+						if (!isText(c.path)) throw notRestorable(c.path);
+						writes.set(c.path, await this.blobText(old));
+						created.add(c.path);
+						summary.push({ path: c.path, change: "restored" });
+					} else if (c.status === "R" && c.from) {
+						const old = (await this.blobAt(base, c.from)) as string;
+						const nowOld = await this.blobAt("HEAD", c.from);
+						if (now === null && nowOld === old) continue; // already moved back
+						if (now === null) throw await conflict(c.path, "was moved or deleted");
+						if (nowOld !== null) throw await conflict(c.from, "was created again");
+						if (isText(c.path) && isText(c.from)) writes.set(c.from, await restoreText(c.path, now, was as string, old));
+						else if (now === was && was === old) renames.push({ from: c.path, to: c.from });
+						else throw notRestorable(c.path);
+						removes.add(c.path);
+						created.add(c.from);
+						summary.push({ path: c.from, change: "moved_back", from: c.path });
+					} else {
+						const old = await this.blobAt(base, c.path);
+						if (now === old) continue; // already as it was
+						if (now === null || old === null) throw await conflict(c.path, "was deleted");
+						if (!isText(c.path)) throw notRestorable(c.path);
+						writes.set(c.path, await restoreText(c.path, now, was as string, old));
+						summary.push({ path: c.path, change: "reverted" });
+					}
+				}
+
+				// The same rules as the other writes: allowed paths, unique names, valid frontmatter, no broken backlinks.
+				const touched = [...writes.keys(), ...removes, ...renames.map((r) => r.to)];
+				for (const p of touched) await this.assertNoSymlink(p);
+				for (const p of created) {
+					if (p.includes("/") || /\.md$/i.test(p)) checkPath(p, this.conventions, /\.md$/i.test(p) ? "note" : "asset");
+					const key = targetNameOf(p);
+					const taken = (/\.md$/i.test(p) ? this.index.notesByName(key).map((n) => n.path) : this.index.assetsByName(key)).filter((t) => t !== p && !removes.has(t));
+					if (taken.length) throw new MemoryError("NAME_TAKEN", `A note or file named «${key}» exists now at ${taken[0]}; names must be unique across folders.`, { path: p, existing: taken });
+				}
+				const kept = new Set([...created].map(targetNameOf));
+				const backlinks: { src_path: string; line: number; target: string }[] = [];
+				for (const p of removes) {
+					const key = targetNameOf(p);
+					if (kept.has(key)) continue; // moved back under the same name
+					for (const l of this.index.linksIn(p)) {
+						if (l.srcPath === p || removes.has(l.srcPath)) continue;
+						const after = writes.get(l.srcPath);
+						if (after !== undefined && !parseTypedLinks(after).some((x) => x.targetName === key)) continue;
+						backlinks.push({ src_path: l.srcPath, line: l.line, target: p });
+					}
+				}
+				if (backlinks.length) {
+					throw new MemoryError("HAS_BACKLINKS", `Reverting ${short} would remove notes that other notes link to; fix or remove those links first${only ? "" : ", or revert only one note with «path»"}.`, { backlinks });
+				}
+				const warnings: Warning[] = [];
+				for (const [p, text] of writes) {
+					if (!/\.md$/i.test(p)) continue;
+					const previous = (await this.exists(p)) ? await this.readText(p) : text;
+					warnings.push(...this.validateNote(p, text, previous));
+					for (const w of this.linkWarnings(text, p)) {
+						if (w.code !== "BROKEN_LINKS") warnings.push({ ...w, path: p });
+						else {
+							// Links to notes this same revert brings back are not broken.
+							const targets = (w.targets as string[]).filter((t) => !kept.has(targetNameOf(t)));
+							if (targets.length) warnings.push({ code: "BROKEN_LINKS", message: `Links to notes that do not exist: ${targets.join(", ")}.`, targets, path: p });
+						}
+					}
+				}
+
+				for (const p of removes) await rm(this.abs(p), { force: true });
+				for (const r of renames) {
+					await mkdir(dirname(this.abs(r.to)), { recursive: true });
+					await rename(this.abs(r.from), this.abs(r.to));
+				}
+				for (const [p, text] of writes) await this.writeText(p, text);
+				const paths = [...new Set([...touched, ...renames.map((r) => r.from)])];
+				const main = only ? (summary[0]?.path ?? only) : (summary.find((s) => /\.md$/i.test(s.path) && s.change !== "removed")?.path ?? summary[0]?.path ?? changes[0]?.path ?? "");
+				return { paths, result: { path: main, reverted: target, changes: summary }, warnings, contentPath: main, trailers: { Reverts: target } };
+			},
+		);
 	}
 
 	async attach(

@@ -127,6 +127,24 @@ export async function createMcpServer(memory: MemoryService, client: ClientIdent
 		wrap("history", (a: { path?: string; name?: string; limit?: number }) => memory.history(a)),
 	);
 
+	server.registerTool(
+		"recent",
+		{
+			title: "Recent changes",
+			description:
+				"The latest changes to the whole memory, newest first: per commit when, who (author and client), which tool, why (the reason) and the notes it touched (added, modified, deleted, moved). Use it to see what changed lately or to find the commit to `revert`. The archive is left out unless include_archive.",
+			inputSchema: {
+				limit: z.number().int().min(1).max(200).optional().describe("Default 20."),
+				since: z.string().optional().describe("Only changes after this: an ISO date (2026-05-01) or an age like 7d, 12h, 2w."),
+				folder: z.string().optional().describe("Only commits that touched this folder, e.g. «personas»."),
+				client: z.string().optional().describe("Only commits by this client id (Client trailer) or author name."),
+				include_archive: z.boolean().optional(),
+			},
+			annotations: read,
+		},
+		wrap("recent", (a: { limit?: number; since?: string; folder?: string; client?: string; include_archive?: boolean }) => memory.recent(a)),
+	);
+
 	if (clients) {
 		server.registerTool(
 			"clients",
@@ -231,6 +249,23 @@ export async function createMcpServer(memory: MemoryService, client: ClientIdent
 			annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
 		},
 		wrap("delete", (a: { path?: string; name?: string; hash: string; reason: string }) => memory.delete(client, a)),
+	);
+
+	server.registerTool(
+		"revert",
+		{
+			title: "Undo a change",
+			description:
+				"Undoes a previous commit (a hash from `recent` or `history`) with a new commit: every note it touched goes back to how it was before it. Give path or name to undo only what it did to that note. Undoing a create deletes the note (refused with HAS_BACKLINKS while other notes link to it); undoing a delete brings it back; undoing a move moves it back. Later changes to the same notes are kept when they don't overlap, otherwise it fails with REVERT_CONFLICT and changes nothing. Binary attachments can be removed or moved back but not restored (NOT_RESTORABLE).",
+			inputSchema: {
+				commit: z.string().describe("The commit to undo, e.g. a hash from `recent` or `history`."),
+				path: notePath.describe("Only undo what the commit did to this note. Give path, name or neither."),
+				name: noteName.describe("Only undo what the commit did to the note with this name."),
+				reason,
+			},
+			annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+		},
+		wrap("revert", (a: { commit: string; path?: string; name?: string; reason: string }) => memory.revert(client, a)),
 	);
 
 	server.registerTool(

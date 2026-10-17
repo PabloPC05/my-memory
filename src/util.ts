@@ -131,3 +131,47 @@ export function checkNewFilename(path: string, conventions: Conventions): void {
 		throw new MemoryError("INVALID_FILENAME", `«${file}» does not match the repo's filename pattern ${conventions.notes.filenamePattern.source}.`, { path, pattern: conventions.notes.filenamePattern.source });
 	}
 }
+
+/** `since` for `recent`: an ISO date (`2026-05-01`, `2026-05-01T10:00`) or an age like `30m`, `12h`, `7d`, `2w`. Returns an ISO timestamp. */
+export function parseSince(input: string, now = Date.now()): string {
+	const text = input.trim();
+	const age = /^(\d+)\s*(m|min|h|d|w)$/i.exec(text);
+	if (age) {
+		const unit = { m: 60_000, min: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 }[(age[2] as string).toLowerCase() as "m" | "min" | "h" | "d" | "w"];
+		return new Date(now - Number(age[1]) * unit).toISOString();
+	}
+	const at = /^\d{4}-\d{2}-\d{2}([T ][\d:.]+(Z|[+-]\d{2}:?\d{2})?)?$/.test(text) ? Date.parse(text) : Number.NaN;
+	if (Number.isNaN(at)) throw new MemoryError("INVALID_ARGUMENT", `«since» must be an ISO date like 2026-05-01 or an age like 7d, 12h, 2w; got «${input}».`);
+	return new Date(at).toISOString();
+}
+
+export interface FileChange {
+	/** First letter of git's status: A, M, D, R (moved), C (copied), T (type changed). */
+	status: string;
+	path: string;
+	/** Previous path, for R and C. */
+	from?: string;
+}
+
+/** Unquotes a path that git printed C-style (only happens for unusual characters, since core.quotepath is off). */
+function unquoteGitPath(p: string): string {
+	if (!p.startsWith('"')) return p;
+	try {
+		return JSON.parse(p) as string;
+	} catch {
+		return p.slice(1, -1);
+	}
+}
+
+/** Parses `--name-status` lines (`M\tpath`, `R096\told\tnew`). */
+export function parseNameStatus(text: string): FileChange[] {
+	const changes: FileChange[] = [];
+	for (const line of text.split("\n")) {
+		const [status, a, b] = line.replace(/\r$/, "").split("\t");
+		if (!status || !a || !/^[ACDMRTUX]/.test(status)) continue;
+		const s = status[0] as string;
+		if ((s === "R" || s === "C") && b) changes.push({ status: s, path: unquoteGitPath(b), from: unquoteGitPath(a) });
+		else changes.push({ status: s, path: unquoteGitPath(a) });
+	}
+	return changes;
+}

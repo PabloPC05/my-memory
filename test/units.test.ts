@@ -4,7 +4,7 @@ import { parseNote, splitFrontmatter } from "../src/frontmatter.js";
 import { maskCode, parseWikiLinks, rewriteWikiLinks, splitSections } from "../src/markdown.js";
 import { parseTypedLinks } from "../src/relations.js";
 import { buildFtsQuery } from "../src/search-index.js";
-import { blobHash, checkNewFilename, checkPath, looksLikeSame } from "../src/util.js";
+import { blobHash, checkNewFilename, checkPath, looksLikeSame, parseNameStatus, parseSince } from "../src/util.js";
 import { CONVENTIONS } from "./helpers.js";
 
 const conv = parseConventions(CONVENTIONS);
@@ -162,5 +162,25 @@ describe("conventions", () => {
 		expect(defaultConventions().relations.allowed).toBeNull();
 		expect(parseConventions('[relations]\nallowed = ["Trabaja_en", "vive_con"]').relations.allowed).toEqual(["trabaja_en", "vive_con"]);
 		expect(() => parseConventions('[relations]\nallowed = ["vive con"]')).toThrow(/relations.allowed/);
+	});
+});
+
+describe("history helpers", () => {
+	it("parses since as an ISO date or an age", () => {
+		const now = Date.parse("2026-05-10T12:00:00Z");
+		expect(parseSince("7d", now)).toBe("2026-05-03T12:00:00.000Z");
+		expect(parseSince("12h", now)).toBe("2026-05-10T00:00:00.000Z");
+		expect(parseSince("2w", now)).toBe("2026-04-26T12:00:00.000Z");
+		expect(parseSince("2026-05-01T10:00:00Z")).toBe("2026-05-01T10:00:00.000Z");
+		expect(() => parseSince("ayer")).toThrow(/since/);
+		expect(() => parseSince("--all")).toThrow(/since/);
+	});
+
+	it("parses name-status lines, renames included", () => {
+		expect(parseNameStatus("\nA\ttemas/a.md\nR087\ttemas/b.md\ttemas/c.md\nD\t\"temas/q\\\"uote.md\"\n")).toEqual([
+			{ status: "A", path: "temas/a.md" },
+			{ status: "R", path: "temas/c.md", from: "temas/b.md" },
+			{ status: "D", path: 'temas/q"uote.md' },
+		]);
 	});
 });

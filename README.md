@@ -38,15 +38,17 @@ On Claude Code it can also install, if you want, a hook that brings relevant not
 | `read` | A note or one section, with its `hash`; `revision` reads an old version |
 | `links` | Outgoing `[[links]]` (broken ones included) and backlinks with context, optionally only one relation |
 | `history` | Commits that touched a note: who, when, why |
+| `recent` | Latest changes to the whole memory: per commit when, who (author and client), tool, reason and the notes it touched; filters `since` (`2026-05-01` or `7d`), `folder`, `client` |
 | `clients` | Who is connected: every token and OAuth app with last seen (time and tool), writes in the last 7 and 30 days, and the `memory-setup` version it left in the notes. Never returns secrets |
 | `create` | New note; unique names across folders; refuses look-alike duplicates unless `confirm_new` |
 | `edit` | Exact text replacements, all or nothing |
 | `write` | Rewrite a whole note; needs the `hash` you read |
 | `move` | Rename or move; rewrites every `[[link]]` to it in the same commit |
 | `delete` | Remove a note (it stays in history); refused while other notes link to it |
+| `revert` | Undo a commit from `recent`/`history` with a new commit, or only what it did to one note; keeps later changes that don't overlap, refuses with `REVERT_CONFLICT` otherwise |
 | `attach` | Store a file in LFS with a searchable companion note |
 
-Clients with a read-only token only see the first five and `clients`.
+Clients with a read-only token only see the read tools: `list`, `search`, `read`, `links`, `history`, `recent` and `clients`.
 
 The server also offers the agent setup guide to every connected client, offline (it ships with the package): as the MCP prompt `setup` ("Set up this memory on your host") and as the resource `memory://agent-setup`, both with the Markdown of [docs/agent-setup.md](docs/agent-setup.md). The server instructions mention them, so an agent that finds itself on an unconfigured host can follow them without being given the URL.
 
