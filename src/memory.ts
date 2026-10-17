@@ -10,6 +10,7 @@ import { MemoryError } from "./errors.js";
 import { extractAttachment, type Extraction } from "./extract.js";
 import { parseNote, splitFrontmatter } from "./frontmatter.js";
 import { Git } from "./git.js";
+import { type LintArgs, lint } from "./lint.js";
 import { type Logger, silentLogger } from "./log.js";
 import { firstH1, rewriteWikiLinks, splitSections, targetNameOf } from "./markdown.js";
 import type { OcrRunner } from "./ocr.js";
@@ -25,9 +26,11 @@ import {
 	type FileChange,
 	joinPath,
 	levenshtein,
+	lookAlikeLabels,
 	looksLikeSame,
 	Mutex,
 	normalizeWords,
+	noteLabels,
 	noteName,
 	parseNameStatus,
 	parseSince,
@@ -636,7 +639,7 @@ export class MemoryService {
 		return this.index
 			.allNotes()
 			.filter((n) => n.path !== exclude)
-			.filter((n) => [n.name, n.title ?? "", ...n.aliases].some((l) => l && wanted.some((w) => looksLikeSame(l, w))))
+			.filter((n) => lookAlikeLabels(noteLabels(n), wanted) !== null)
 			.slice(0, 10)
 			.map((n) => ({ path: n.path, name: n.name, description: n.description }));
 	}
@@ -1037,6 +1040,11 @@ export class MemoryService {
 			if (blocks.length < page) break;
 		}
 		return { commits, ...(since ? { since } : {}) };
+	}
+
+	/** Maintenance worklist from the index (see lint.ts). `nowMs` is for tests. */
+	lint(args: LintArgs = {}, nowMs: number = Date.now()) {
+		return lint(this.index, this.conventions, args, nowMs);
 	}
 
 	// ── write tools ──────────────────────────────────────────────────────────

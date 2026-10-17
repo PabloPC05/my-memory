@@ -137,6 +137,24 @@ The `clients` tool (available to read-only tokens too) and `my-memory clients --
 - **Writes:** counted from the `Client:` trailers of the commits on the current branch, for the last 7 and 30 days. A client that only appears in the activity log or in git (token revoked, OAuth app gone) is still listed and flagged as no longer known.
 - **Setup version:** the latest `memory-setup <version>` record found in the notes, attributed to the client whose id or name appears nearby, or failing that to the only client named in the file or the author of the last commit that touched it. Best effort.
 
+## Lint
+
+Andrej Karpathy's "LLM wiki" pattern has the model do three things with a wiki: ingest sources, answer from it, and periodically lint it for contradictions, stale claims, orphan pages, concepts without a page of their own and missing cross-references. Most of that needs judgment, but finding the candidates does not. The `lint` tool (read-only tokens too) and `my-memory lint --config config.toml` (`--json`, `--kind`, `--folder`, `--limit`) are that cheap half: a worklist computed from the index and git dates, with no model, so the maintaining agent reads only the notes that need it and does the judgment half (is this a contradiction, does that inference still hold, merge or link, split where).
+
+| Kind | Found from |
+|---|---|
+| `problems` | The catalog's `problems` (bad frontmatter, file names, relations), superseded notes outside the archive, duplicate names |
+| `broken_link` | Links with no target |
+| `duplicate_candidates` | Pairs of notes whose labels look alike, with the same rule as `create`'s `DUPLICATE_CANDIDATES`. Candidates come from a bigram index and a word index, exact filters for that rule (the q-gram bound for the edit distance, the rarest word for containment), so it is not quadratic and finds the same pairs |
+| `old_inference` | Lines with an inference marker (`(deducido)`, `(deducido, 2026-01-31)`; the words come from `[lint] inferred_markers`) older than `inference_days`. An undated marker is at least as old as the note's last change |
+| `missing_page` | A missing target linked from `missing_page_min` notes or more, reported once instead of as broken links |
+| `unlinked_mention` | A note's name, title or alias in the plain text of a note that never links to it (whole words, accents ignored; ambiguous and short labels skipped; code, links and headings ignored) |
+| `orphan` | Notes with no links in, except from the archive; root files count as sources. `orphan_exclude` folders (default `index_full`) are exempt |
+| `stale` | Last commit older than `stale_days` |
+| `oversized` | Files bigger than `max_bytes`, except attachment companions |
+
+Root files and the archive are never reported, and `[lint] exclude` adds folders. Items come in the order of the table, worst first within each kind, each with its notes and a short detail (line, snippet, target, days); `counts` has the totals per kind before `limit`. Section text comes from the FTS table, which keeps it, so lint reads no files and needs no new index tables; a few thousand notes take well under a second.
+
 ## Agent setup guide
 
 [docs/agent-setup.md](agent-setup.md) ships inside the package and the server offers it offline to every connected client: as the MCP prompt `setup` ("Set up this memory on your host") and as the resource `memory://agent-setup`, both with the Markdown of the guide. The server instructions mention them, so an agent on an unconfigured host can follow the guide without being given the URL. Agents compare the `memory-setup <version>` line they installed with the guide's version (see the [changelog](agent-setup/changelog.md)), and the `clients` view shows which version each one has.
