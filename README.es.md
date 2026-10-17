@@ -16,4 +16,6 @@ Una memoria autoalojada para agentes de IA. Tus notas son una carpeta de Markdow
 
 Las herramientas, la configuración, el módulo de NixOS y cómo conectar cada cliente están en el [README en inglés](README.md); cómo funciona por dentro, en [docs/design.md](docs/design.md).
 
+Para que cada agente la use de verdad, pásale [docs/agent-setup.md](docs/agent-setup.md) y dile «instala mi memoria»: importa lo que ya recuerda, instala sus instrucciones permanentes y, donde la plataforma lo permite (Claude Code, tus propios agentes), le impide guardar en otro sitio.
+
 Licencia Apache-2.0.
