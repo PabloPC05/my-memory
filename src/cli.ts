@@ -4,7 +4,7 @@ import { parseArgs } from "node:util";
 import { ForgejoOAuthProvider } from "./auth/oauth.js";
 import { addToken, listTokens, revokeToken } from "./auth/tokens.js";
 import { buildClientsReport, ClientActivity, renderClientsTable } from "./clients.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, readSecretFile } from "./config.js";
 import { Git } from "./git.js";
 import { jsonLogger } from "./log.js";
 import { MemoryService } from "./memory.js";
@@ -21,7 +21,7 @@ Usage:
   my-memory oauth list --config <file>
   my-memory oauth revoke <client_id|all> --config <file>
   my-memory clients [--json] --config <file>   who is connected: last seen, writes, setup version
-  my-memory reindex --config <file>          full rebuild of the index (stop the service first)
+  my-memory reindex [--reembed] --config <file>   full rebuild of the index and missing embeddings (stop the service first)
   my-memory migrate <repo-dir> [--apply] [--conventions <memory.toml>]
 
 The config file is TOML; see the README for every key.
@@ -47,6 +47,7 @@ export async function main(argv: string[]): Promise<number> {
 			apply: { type: "boolean" },
 			conventions: { type: "string" },
 			json: { type: "boolean" },
+			reembed: { type: "boolean" },
 			help: { type: "boolean", short: "h" },
 		},
 	});
@@ -142,16 +143,37 @@ export async function main(argv: string[]): Promise<number> {
 		if (command === "reindex") {
 			if (!values.config) throw new Error("reindex needs --config");
 			const config = loadConfig(values.config, { secrets: false });
+			let embeddings = config.embeddings;
+			if (embeddings?.apiKeyFile) {
+				try {
+					embeddings = { ...embeddings, apiKey: readSecretFile(embeddings.apiKeyFile) };
+				} catch (error) {
+					process.stderr.write(`Embeddings skipped: ${(error as Error).message}. The service embeds the missing sections when it starts.\n`);
+					embeddings = null;
+				}
+			}
 			const memory = new MemoryService({
 				repoDir: join(config.dataDir, "repo"),
 				indexPath: join(config.dataDir, "index.sqlite"),
 				branch: config.branch,
 				remote: null,
 				log: jsonLogger(),
+				embeddings,
 			});
 			await memory.start();
-			await memory.rebuildIndex();
-			await memory.stop();
+			try {
+				await memory.rebuildIndex({ reembed: values.reembed });
+				if (memory.embedder) {
+					try {
+						const r = await memory.embedder.flush();
+						process.stderr.write(`Embedded ${r.embedded} section(s); ${r.pending} pending.\n`);
+					} catch (error) {
+						process.stderr.write(`Embeddings failed: ${(error as Error).message}. The index is rebuilt; the service embeds the missing sections when it starts.\n`);
+					}
+				}
+			} finally {
+				await memory.stop();
+			}
 			return 0;
 		}
 		if (command === "migrate") {

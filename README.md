@@ -13,6 +13,7 @@ A self-hosted memory for AI agents. Your notes are a folder of Markdown files in
 - **Two front doors.** A private listener for static per-client tokens, file uploads and the git webhook. A public listener that only accepts OAuth 2.1 tokens (dynamic client registration and PKCE, sign-in delegated to Forgejo) for remote clients like claude.ai.
 - **Attachments.** Binaries go to git LFS with a companion note holding their text (PDFs via `pdftotext`; scanned PDFs and images via local OCR with `tesseract`, when installed), so they are searchable too.
 - **Typed links.** `works_at:: [[acme]]` says what a link means, and `links` can filter by it.
+- **Optional search by meaning.** Point `[embeddings]` at any OpenAI-compatible embeddings endpoint (Ollama or llama.cpp on the same CPU, TEI, OpenAI…) and `search` fuses full text with vector similarity, so "car" finds the note that says "vehicle". No model runs inside the server and no GPU is needed; without it, search is full text only.
 
 How it works inside (index, write flow, concurrency, auth): [docs/design.md](docs/design.md).
 
@@ -33,7 +34,7 @@ On Claude Code it can also install, if you want, a hook that brings relevant not
 | Tool | What it does |
 |---|---|
 | `list` | Short index, or every note in a folder with description, aliases and last change |
-| `search` | Full-text search by section (accents ignored, prefixes match) with snippets |
+| `search` | Full-text search by section (accents ignored, prefixes match) with snippets; hybrid with search by meaning when `[embeddings]` is set |
 | `read` | A note or one section, with its `hash`; `revision` reads an old version |
 | `links` | Outgoing `[[links]]` (broken ones included) and backlinks with context, optionally only one relation |
 | `history` | Commits that touched a note: who, when, why |
@@ -139,6 +140,16 @@ languages = "spa+eng"                           # tesseract language codes; defa
 max_pages = 50                                  # pages of a scanned PDF that are OCR'd
 page_timeout_seconds = 120                      # per page (render + recognition) or image
 # dpi = 300; tesseract = "tesseract"; pdftoppm = "pdftoppm"
+
+[embeddings]                                    # optional: search by meaning; omit for full text only
+url = "http://127.0.0.1:11434/v1/embeddings"    # any OpenAI-compatible endpoint (Ollama, llama.cpp, TEI, OpenAI…)
+model = "nomic-embed-text"
+# api_key_file = "embeddings-key"               # sent as a Bearer token, if the endpoint needs one
+# dimensions = 512                              # for models that can shorten their output
+# batch_size = 32
+# timeout_seconds = 60
+query_prefix = "search_query: "                 # some models want their inputs marked (nomic, e5)
+document_prefix = "search_document: "
 ```
 
 Uploads for `attach`: `curl -T file.pdf -H "Authorization: Bearer $TOKEN" http://host:8782/uploads/file.pdf` returns an `upload_id`. There is no size limit.
@@ -161,6 +172,18 @@ Uploads for `attach`: `curl -T file.pdf -H "Authorization: Bearer $TOKEN" http:/
 ```
 
 After `my-memory token add … --file <tokensFile>`, run `systemctl reload my-memory`. The package brings pdftotext, pdftoppm and tesseract; the module installs the language data listed in `ocr.languages` (default Spanish and English).
+
+For search by meaning, add `embeddings = { url = "http://127.0.0.1:11434/v1/embeddings"; model = "nomic-embed-text"; queryPrefix = "search_query: "; documentPrefix = "search_document: "; };` (with `apiKeyFile` if the endpoint needs a key), for example next to `services.ollama`.
+
+### Search by meaning
+
+With `[embeddings]`, every section of every note gets a vector from the endpoint, stored in `index.sqlite`. `search` then takes `mode`: `hybrid` (default) fuses the full-text ranking and the vector ranking with Reciprocal Rank Fusion, `text` is the plain full-text search, `semantic` uses vectors only. The answer has the same shape as always.
+
+- **Writes never wait for it.** Sections are embedded in the background after each commit or sync; until then they are found by text. Only sections whose text changed are embedded again, and changing `model`, `dimensions` or `document_prefix` embeds everything again.
+- **If the endpoint is down**, writes work as usual, search falls back to full text with a warning in the log, and pending sections are retried with backoff.
+- **Status in the log:** `embeddings.status` at startup (model, vectors, sections pending), `embeddings.done` after each run, `embeddings.failed` while the endpoint fails.
+- `my-memory reindex` also embeds the sections that are missing; `--reembed` embeds them all again. With a `credential:` key it cannot read outside systemd, it skips embedding and the service does it when it starts.
+- On a small CPU-only server, Ollama with `nomic-embed-text` (multilingual: `bge-m3` or `multilingual-e5-small`, the e5 ones with prefixes `query: ` and `passage: `) embeds a few thousand sections in minutes, once.
 
 ### Connecting clients
 

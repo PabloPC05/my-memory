@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { stringify as stringifyYaml } from "yaml";
 import { CONVENTIONS_FILE, type Conventions, defaultConventions, parseConventions } from "./conventions.js";
+import { dot, EmbeddingClient, Embedder, type EmbeddingsConfig, reciprocalRankFusion } from "./embeddings.js";
 import { MemoryError } from "./errors.js";
 import { extractAttachment, type Extraction } from "./extract.js";
 import { parseNote, splitFrontmatter } from "./frontmatter.js";
@@ -13,7 +14,7 @@ import { firstH1, rewriteWikiLinks, splitSections } from "./markdown.js";
 import type { OcrRunner } from "./ocr.js";
 import { parseTypedLinks } from "./relations.js";
 import { SETUP_GUIDE_URI, SETUP_GUIDE_URL } from "./setup-guide.js";
-import { buildFtsQuery, type NoteRow, SearchIndex } from "./search-index.js";
+import { buildFtsQuery, type NoteRow, type SearchHit, SearchIndex } from "./search-index.js";
 import type { UploadStore } from "./uploads.js";
 import {
 	blobHash,
@@ -61,7 +62,14 @@ export interface MemoryOptions {
 	log?: Logger;
 	pushRetry?: { initialMs: number; maxMs: number };
 	fetchIntervalMs?: number;
+	/** Optional semantic search through an embeddings endpoint; without it search is full-text only. */
+	embeddings?: EmbeddingsConfig | null;
+	embeddingsRetry?: { initialMs: number; maxMs: number };
 }
+
+export type SearchMode = "hybrid" | "text" | "semantic";
+
+type SearchArgs = { query: string; folder?: string; include_archive?: boolean; limit?: number };
 
 export interface Warning {
 	code: "BROKEN_LINKS" | "UNKNOWN_RELATIONS" | "PUSH_PENDING" | "EXTRACTION_EMPTY" | "EXTRACTION_PARTIAL" | "NO_CHANGES" | "FRONTMATTER_PROBLEMS";
@@ -100,6 +108,8 @@ export class MemoryService {
 	private fetchTimer: NodeJS.Timeout | null = null;
 	private syncTimer: NodeJS.Timeout | null = null;
 	private syncRequested = false;
+	/** Background embedding of sections; null when `[embeddings]` is not configured. */
+	readonly embedder: Embedder | null = null;
 
 	constructor(readonly opts: MemoryOptions) {
 		this.log = opts.log ?? silentLogger;
@@ -111,6 +121,7 @@ export class MemoryService {
 			config["http.extraHeader"] = `Authorization: Basic ${basic}`;
 		}
 		this.git = new Git(opts.repoDir, { config });
+		if (opts.embeddings) this.embedder = new Embedder(new EmbeddingClient(opts.embeddings), () => this.index, this.log, opts.embeddingsRetry);
 	}
 
 	// ── lifecycle ────────────────────────────────────────────────────────────
@@ -151,7 +162,12 @@ export class MemoryService {
 		}
 		await this.loadConventions();
 		this.index = new SearchIndex(this.opts.indexPath);
+		this.embedder?.checkModel();
 		await this.reconcileIndex();
+		if (this.embedder) {
+			this.log("info", "embeddings.status", this.embedder.status());
+			this.embedder.schedule();
+		}
 		if (this.opts.remote) {
 			await this.lock.run(() => this.syncLocked("startup")).catch((error) => this.log("warn", "sync.startup_failed", { error: String(error) }));
 		}
@@ -164,6 +180,7 @@ export class MemoryService {
 	async stop(): Promise<void> {
 		for (const t of [this.pushTimer, this.fetchTimer, this.syncTimer]) if (t) clearTimeout(t);
 		await this.lock.run(async () => undefined);
+		await this.embedder?.stop();
 		this.index?.close();
 	}
 
@@ -295,6 +312,7 @@ export class MemoryService {
 			throw error;
 		}
 		this.log("info", "index.full", { files: files.length, ms: Date.now() - started, ...this.index.counts() });
+		this.embedder?.schedule();
 	}
 
 	private async incrementalReindex(from: string, to: string): Promise<void> {
@@ -339,6 +357,7 @@ export class MemoryService {
 			throw error;
 		}
 		this.log("info", "index.incremental", { changed: changed.length, ms: Date.now() - started });
+		this.embedder?.schedule();
 	}
 
 	/** Brings the index to HEAD: nothing, incremental, or a full rebuild if it cannot tell what changed. */
@@ -351,10 +370,11 @@ export class MemoryService {
 		return this.fullReindex(head);
 	}
 
-	/** Full rebuild on demand (`my-memory reindex --full`). */
-	async rebuildIndex(): Promise<void> {
+	/** Full rebuild on demand (`my-memory reindex`). `reembed` also drops every vector, so all sections are embedded again. */
+	async rebuildIndex(opts: { reembed?: boolean } = {}): Promise<void> {
 		await this.lock.run(async () => {
 			await this.loadConventions();
+			if (opts.reembed) this.index.clearVectors();
 			await this.fullReindex(await this.git.head());
 		});
 	}
@@ -768,20 +788,65 @@ export class MemoryService {
 		};
 	}
 
-	search(args: { query: string; folder?: string; include_archive?: boolean; limit?: number }) {
+	private searchOpts(args: SearchArgs) {
+		return { folder: args.folder ? args.folder.replace(/\/+$/, "") : null, includeArchive: args.include_archive ?? false, limit: Math.min(Math.max(args.limit ?? 10, 1), 50) };
+	}
+
+	private textHits(args: SearchArgs, limit?: number): { mode: "all" | "any"; hits: SearchHit[] } {
 		const q = buildFtsQuery(args.query ?? "");
 		if (!q) throw new MemoryError("INVALID_ARGUMENT", "The query has no words to search for.");
-		const opts = { folder: args.folder ? args.folder.replace(/\/+$/, "") : null, includeArchive: args.include_archive ?? false, limit: Math.min(Math.max(args.limit ?? 10, 1), 50) };
+		const opts = { ...this.searchOpts(args), ...(limit ? { limit } : {}) };
 		let mode: "all" | "any" = "all";
 		let hits = this.index.search(q.and, opts);
 		if (hits.length === 0 && q.or !== q.and) {
 			hits = this.index.search(q.or, opts);
 			mode = "any";
 		}
-		return {
-			mode,
-			hits: hits.map((h) => ({ path: h.path, name: h.name, description: h.description, section: { heading: h.section.heading, level: h.section.level, line_start: h.section.lineStart, line_end: h.section.lineEnd }, snippet: h.snippet, score: h.score })),
-		};
+		return { mode, hits };
+	}
+
+	private static hitsOut(hits: (SearchHit | null)[]) {
+		return hits
+			.filter((h): h is SearchHit => h !== null)
+			.map((h) => ({ path: h.path, name: h.name, description: h.description, section: { heading: h.section.heading, level: h.section.level, line_start: h.section.lineStart, line_end: h.section.lineEnd }, snippet: h.snippet, score: h.score }));
+	}
+
+	/** Full-text search only (bm25). */
+	search(args: SearchArgs) {
+		const { mode, hits } = this.textHits(args);
+		return { mode, hits: MemoryService.hitsOut(hits) };
+	}
+
+	/**
+	 * The `search` tool. With embeddings configured, `hybrid` (the default) fuses the full-text ranking with the
+	 * ranking by cosine similarity to the query's vector (Reciprocal Rank Fusion), and `semantic` uses the vectors
+	 * alone. If the query cannot be embedded, the answer is the full-text search, the same as without embeddings.
+	 */
+	async searchAny(args: SearchArgs & { mode?: SearchMode }) {
+		const want = this.embedder ? (args.mode ?? "hybrid") : "text";
+		if (want === "text") return this.search(args);
+		const opts = this.searchOpts(args);
+		const pool = Math.max(opts.limit * 3, 30);
+		const text = this.textHits(args, pool);
+		const vector = await (this.embedder as Embedder).embedQuery(args.query);
+		if (!vector) return this.search(args);
+		const ranked = this.index
+			.sectionVectors(opts)
+			.filter((s) => s.vector.length === vector.length)
+			.map((s) => ({ id: s.sectionId, similarity: dot(s.vector, vector) }))
+			.sort((a, b) => b.similarity - a.similarity)
+			.slice(0, pool);
+		const round = (x: number) => Math.round(x * 10_000) / 10_000;
+		if (want === "semantic") {
+			return { mode: "semantic" as const, hits: MemoryService.hitsOut(ranked.slice(0, opts.limit).map((r) => this.index.sectionHit(r.id, round(r.similarity)))) };
+		}
+		const byId = new Map(text.hits.map((h) => [h.sectionId, h]));
+		const fused = [...reciprocalRankFusion([text.hits.map((h) => h.sectionId), ranked.map((r) => r.id)])].sort((a, b) => b[1] - a[1]).slice(0, opts.limit);
+		const hits = fused.map(([id, score]) => {
+			const h = byId.get(id);
+			return h ? { ...h, score: round(score) } : this.index.sectionHit(id, round(score));
+		});
+		return { mode: "hybrid" as const, hits: MemoryService.hitsOut(hits) };
 	}
 
 	async read(args: NoteRef & { section?: string; revision?: string }) {
