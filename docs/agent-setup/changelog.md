@@ -4,6 +4,13 @@ Agents compare the `memory-setup <version>` line of the instructions they instal
 of [the guide](../agent-setup.md), and propose updates when this file lists a newer one. Bump the version only for
 changes an installed agent should act on.
 
+## 0.3.1 — 2026-10-17
+
+Discovery checks the agent's identity: if the server offers a `clients` tool, the agent looks at it and, when
+its writes would be attributed to a shared identity (a gateway's name, or a name other agents use), says so in
+the proposal and recommends its own credential. Setup is never blocked by it. Installed agents: no change to
+your instructions is needed.
+
 ## 0.3.0 — 2026-10-17
 
 Skills travel with the memory, as in Notion's setup. Discovery lists the host's personal skills and checks

@@ -4,6 +4,8 @@ A self-hosted memory for AI agents. Your notes are a folder of Markdown files in
 
 *[Leer en español](README.es.md)*
 
+> Keep this file and [README.es.md](README.es.md) in sync: when you edit one, update the other.
+
 - **Git is the source of truth.** Search runs on a SQLite index (catalog, FTS5 full text by section, wikilinks) that can be rebuilt from git at any time.
 - **One commit per write**, authored by the client: `Claude Code (laptop)`, `Alex (Claude)`…. The commit message is the reason the agent gave, plus `Client:` / `Tool:` / `Session:` trailers.
 - **Safe for several agents at once.** One writer queue, optimistic concurrency (`hash` from `read`), and pushes from elsewhere (your PC, Forgejo's web editor) integrated by rebase.
@@ -166,6 +168,14 @@ bearer_token_env_var = "MY_MEMORY_TOKEN"
 claude.ai: Settings → Connectors → Add custom connector → `https://memory.example.com/mcp`.
 
 Then give the agent the setup link ([Give your agent one link](#give-your-agent-one-link)).
+
+### One credential per agent
+
+my-memory attributes every write (the git commit author and its `Client:` trailer), every log line and the `clients` view to the credential the request used. So **each agent must connect with its own credential**. If two agents share one, nobody can tell who wrote what, `clients` cannot tell them apart, and a leaked key cannot be revoked without cutting off the other agent too.
+
+- **Static tokens:** create one per agent and never share it: `my-memory token add <id> --name "<Agent name>" --scope write|read --file tokens.toml`. OAuth clients (for example claude.ai connecting directly) get their own identity automatically.
+- **Behind a gateway or proxy** that joins several MCP servers into one endpoint, the gateway is the client my-memory sees. Give the gateway one key per agent and map each key to its own my-memory token (same public URL, a different key per agent); otherwise every write shows the gateway's name. This pattern has been done with Caddy plus agentgateway, but any gateway that can pick the upstream credential from the incoming key works.
+- **Check it:** run `my-memory clients` or call the `clients` tool. Each agent must appear on its own row, with its last activity and its writes.
 
 ### Moving an existing repo to wikilinks
 

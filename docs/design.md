@@ -20,6 +20,7 @@ How my-memory works inside, for people who want to run it, change it or build so
            ├─ repo/          working clone of the notes repo
            ├─ index.sqlite   derived index, rebuildable from git
            ├─ state.sqlite   OAuth clients, codes and tokens (not derivable)
+           ├─ activity.sqlite  last seen per client (not derivable, not in the notes repo)
            └─ uploads/       pending uploads
                           │ fetch / push
                           ▼
@@ -107,7 +108,21 @@ Binaries go to git LFS: `attach` adds the LFS rule for the extension to `.gitatt
 
 - **Static tokens** for local clients: one per client, `mm_` plus 32 random bytes, stored as SHA-256 hashes in a TOML file that the server reloads on `SIGHUP`. Each has an id (commit trailer and author email), a name (commit author) and a scope (`read` or `write`). Read-only clients don't see the write tools.
 - **OAuth 2.1** for remote clients such as claude.ai. my-memory is its own authorization server, with discovery (RFC 9728 and RFC 8414), open dynamic client registration (registering grants nothing by itself) and mandatory PKCE. The user signs in through Forgejo's OAuth2, and only the logins in `allowed_users` get through. Access tokens live one hour; refresh tokens live 30 days and rotate on every use, and reusing a rotated one revokes its whole family. Everything is stored hashed. Commits from OAuth clients are authored `"<Forgejo full name> (<client name>)"`.
+- **One credential per agent.** Identity is whatever credential the request carried, and that is all my-memory knows: the commit author, the `Client:` trailer, the log line and the `clients` view all use it. Two agents sharing a credential are one client to the server. Create one static token per agent (`my-memory token add <id> --name "<Agent name>" …`); OAuth clients get their own identity on registration. Behind a gateway or proxy that joins several MCP servers into one endpoint, the gateway is the client the server sees: give the gateway one key per agent and map each key to its own my-memory token, with the same public URL and a different key per agent, or every write is attributed to the gateway (done with Caddy plus agentgateway, but the pattern is generic). To verify, `my-memory clients` or the `clients` tool must show each agent on its own row.
 - **The public listener** rate-limits the OAuth endpoints per IP and exposes nothing else without an access token.
+
+## Connected clients
+
+The `clients` tool (available to read-only tokens too) and `my-memory clients --config config.toml` (`--json` for scripts) answer "who is connected". The report joins three sources and never includes tokens or hashes:
+
+- **Known clients:** every static token (from the tokens file, without hashes) and every OAuth client registered in `state.sqlite`.
+- **Last seen:** `activity.sqlite` in the data dir, a small SQLite file of its own (not in the notes repo and not in the rebuildable index). It keeps per client the name, scope, last request time and last tool. The in-memory copy is always current; the file is written at most once a minute per client and on shutdown. The CLI reads a snapshot without side effects.
+- **Writes:** counted from the `Client:` trailers of the commits on the current branch, for the last 7 and 30 days. A client that only appears in the activity log or in git (token revoked, OAuth app gone) is still listed and flagged as no longer known.
+- **Setup version:** the latest `memory-setup <version>` record found in the notes, attributed to the client whose id or name appears nearby, or failing that to the only client named in the file or the author of the last commit that touched it. Best effort.
+
+## Agent setup guide
+
+[docs/agent-setup.md](agent-setup.md) ships inside the package and the server offers it offline to every connected client: as the MCP prompt `setup` ("Set up this memory on your host") and as the resource `memory://agent-setup`, both with the Markdown of the guide. The server instructions mention them, so an agent on an unconfigured host can follow the guide without being given the URL. Agents compare the `memory-setup <version>` line they installed with the guide's version (see the [changelog](agent-setup/changelog.md)), and the `clients` view shows which version each one has.
 
 ## Observability
 
