@@ -35,15 +35,17 @@ El agente lee [la guía de instalación](docs/agent-setup.md) y se instala tu me
 | `read` | Una nota o una sección, con su `hash`; `revision` lee una versión antigua |
 | `links` | Enlaces `[[...]]` salientes (también los rotos) y retroenlaces con contexto, opcionalmente solo una relación |
 | `history` | Commits que tocaron una nota: quién, cuándo, por qué |
+| `recent` | Últimos cambios de toda la memoria: por commit cuándo, quién (autor y cliente), herramienta, motivo y las notas que tocó; filtros `since` (`2026-05-01` o `7d`), `folder`, `client` |
 | `clients` | Quién está conectado: cada token y app OAuth con su última conexión (hora y herramienta), escrituras en los últimos 7 y 30 días y la versión de `memory-setup` que dejó anotada en las notas. Nunca devuelve secretos |
 | `create` | Nota nueva; nombres únicos entre carpetas; rechaza duplicados parecidos salvo `confirm_new` |
 | `edit` | Reemplazos de texto exactos, todos o ninguno |
 | `write` | Reescribe una nota entera; necesita el `hash` que leíste |
 | `move` | Renombra o mueve; reescribe todos los `[[enlaces]]` a ella en el mismo commit |
 | `delete` | Borra una nota (queda en el historial); se rechaza mientras otras notas la enlacen |
+| `revert` | Deshace un commit de `recent`/`history` con un commit nuevo, o solo lo que hizo en una nota; conserva los cambios posteriores que no se solapan y si no, se rechaza con `REVERT_CONFLICT` |
 | `attach` | Guarda un archivo en LFS con una nota al lado en la que se puede buscar |
 
-Los clientes con un token de solo lectura ven solo las cinco primeras y `clients`.
+Los clientes con un token de solo lectura ven solo las herramientas de lectura: `list`, `search`, `read`, `links`, `history`, `recent` y `clients`.
 
 El servidor también ofrece la guía de instalación para agentes a todo cliente conectado, sin conexión (va dentro del paquete): como prompt MCP `setup` («Set up this memory on your host») y como recurso `memory://agent-setup`, ambos con el Markdown de [docs/agent-setup.md](docs/agent-setup.md). Las instrucciones del servidor los mencionan, así que un agente que se encuentre en una plataforma sin configurar puede seguirlos sin que le des la URL.
 
