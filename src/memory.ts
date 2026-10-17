@@ -5,11 +5,12 @@ import { randomBytes } from "node:crypto";
 import { stringify as stringifyYaml } from "yaml";
 import { CONVENTIONS_FILE, type Conventions, defaultConventions, parseConventions } from "./conventions.js";
 import { MemoryError } from "./errors.js";
-import { extractPdf, type Extraction } from "./extract.js";
+import { extractAttachment, type Extraction } from "./extract.js";
 import { parseNote, splitFrontmatter } from "./frontmatter.js";
 import { Git } from "./git.js";
 import { type Logger, silentLogger } from "./log.js";
 import { firstH1, rewriteWikiLinks, splitSections } from "./markdown.js";
+import type { OcrRunner } from "./ocr.js";
 import { parseTypedLinks } from "./relations.js";
 import { SETUP_GUIDE_URI, SETUP_GUIDE_URL } from "./setup-guide.js";
 import { buildFtsQuery, type NoteRow, SearchIndex } from "./search-index.js";
@@ -55,13 +56,15 @@ export interface MemoryOptions {
 	committer?: { name: string; email: string };
 	uploads?: UploadStore | null;
 	pdftotext?: string;
+	/** OCR for scanned PDFs and images; null or absent means no OCR. */
+	ocr?: OcrRunner | null;
 	log?: Logger;
 	pushRetry?: { initialMs: number; maxMs: number };
 	fetchIntervalMs?: number;
 }
 
 export interface Warning {
-	code: "BROKEN_LINKS" | "UNKNOWN_RELATIONS" | "PUSH_PENDING" | "EXTRACTION_EMPTY" | "NO_CHANGES" | "FRONTMATTER_PROBLEMS";
+	code: "BROKEN_LINKS" | "UNKNOWN_RELATIONS" | "PUSH_PENDING" | "EXTRACTION_EMPTY" | "EXTRACTION_PARTIAL" | "NO_CHANGES" | "FRONTMATTER_PROBLEMS";
 	message: string;
 	[key: string]: unknown;
 }
@@ -1049,7 +1052,7 @@ export class MemoryService {
 		const upload = args.source.upload_id ? await uploads.get(args.source.upload_id) : await uploads.get((await uploads.fromBase64(args.source.base64 as string, fileName, client.id)).id);
 		const ext = (fileName.split(".").pop() as string).toLowerCase();
 		// Extraction runs before taking the write lock: it can be slow and touches only the upload.
-		const extraction: Extraction = ext === "pdf" ? await extractPdf(upload.file, { binary: this.opts.pdftotext }) : { method: "none", pages: [], reason: `no text extractor for .${ext} files` };
+		const extraction: Extraction = await extractAttachment(upload.file, ext, { pdftotext: this.opts.pdftotext, ocr: this.opts.ocr });
 		const result = await this.mutate(client, "attach", args.reason, async () => {
 			if (!this.lfs) throw new MemoryError("LFS_UNAVAILABLE", "git-lfs is not installed on the server.");
 			const dir = dirOf(binPath);
@@ -1088,13 +1091,20 @@ export class MemoryService {
 			}
 			const fm: Record<string, unknown> = { name: title, description: args.description.replace(/\s+/g, " ").trim(), aliases, attachment: fileName, extracted_with: extraction.method };
 			let body = `# ${title}\n\n![[${fileName}]]\n`;
-			for (const page of extraction.pages) body += `\n## ${this.conventions.attachments.pageHeading.replace("{n}", String(page.number))}\n\n${page.text}\n`;
+			if (extraction.ocr) body += `\n> ${this.conventions.attachments.ocrNotice.replace("{languages}", extraction.ocr.languages)}\n`;
+			if (extraction.image && extraction.pages.length === 1) body += `\n${extraction.pages[0]?.text}\n`;
+			else for (const page of extraction.pages) body += `\n## ${this.conventions.attachments.pageHeading.replace("{n}", String(page.number))}\n\n${page.text}\n`;
 			const content = `---\n${stringifyYaml(fm, { lineWidth: 0 }).trimEnd()}\n---\n${body}`;
 			this.validateNote(companion, content);
 			await this.writeText(companion, content);
 			const warnings: Warning[] = [];
 			if (extraction.method === "none") warnings.push({ code: "EXTRACTION_EMPTY", message: `No text was extracted: ${extraction.reason ?? "unknown reason"}.` });
-			return { paths, result: { path: companion, attachment: binPath, pages: extraction.pages.length }, warnings, contentPath: companion };
+			const { skippedPages = 0, failedPages = [] } = extraction.ocr ?? {};
+			if (skippedPages || failedPages.length) {
+				const parts = [skippedPages ? `the last ${skippedPages} of ${extraction.pageCount} pages were not OCR'd (page limit)` : "", failedPages.length ? `OCR failed on page(s) ${failedPages.join(", ")}` : ""].filter(Boolean);
+				warnings.push({ code: "EXTRACTION_PARTIAL", message: `Only part of the text was extracted: ${parts.join("; ")}.`, skipped_pages: skippedPages, failed_pages: failedPages });
+			}
+			return { paths, result: { path: companion, attachment: binPath, pages: extraction.pages.length, extracted_with: extraction.method }, warnings, contentPath: companion };
 		});
 		await uploads.remove(upload.meta.id).catch(() => undefined);
 		return result;

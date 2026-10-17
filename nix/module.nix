@@ -18,6 +18,9 @@ let
   cfg = config.services.my-memory;
   toml = pkgs.formats.toml { };
 
+  # Tesseract with just the language data the OCR config asks for.
+  ocrTesseract = pkgs.tesseract.override { enableLanguages = lib.unique cfg.ocr.languages; };
+
   listenType = types.submodule {
     options = {
       address = mkOption {
@@ -43,6 +46,14 @@ let
       fetch_interval_seconds = cfg.fetchIntervalSeconds;
       log_level = cfg.logLevel;
       pdftotext = "${pkgs.poppler-utils}/bin/pdftotext";
+      ocr = {
+        enabled = cfg.ocr.enable;
+        languages = lib.concatStringsSep "+" cfg.ocr.languages;
+        max_pages = cfg.ocr.maxPages;
+        page_timeout_seconds = cfg.ocr.pageTimeoutSeconds;
+        tesseract = "${ocrTesseract}/bin/tesseract";
+        pdftoppm = "${pkgs.poppler-utils}/bin/pdftoppm";
+      };
       listen =
         optionalAttrs (cfg.listen.public != null) { public = cfg.listen.public; }
         // optionalAttrs (cfg.listen.private != null) { private = cfg.listen.private; };
@@ -183,6 +194,37 @@ in
       description = "Safety-net fetch from the remote, in case a webhook is missed. 0 disables it.";
     };
 
+    ocr = {
+      enable = mkOption {
+        type = types.bool;
+        default = true;
+        description = "OCR scanned PDFs (pdftoppm + tesseract) and images (tesseract) when they are attached.";
+      };
+      languages = mkOption {
+        type = types.listOf types.str;
+        default = [
+          "spa"
+          "eng"
+        ];
+        example = [
+          "spa"
+          "eng"
+          "fra"
+        ];
+        description = "Tesseract languages, in order of preference; their language data is installed for the service.";
+      };
+      maxPages = mkOption {
+        type = types.ints.positive;
+        default = 50;
+        description = "Pages of a scanned PDF that are OCR'd; the rest is left out with a warning.";
+      };
+      pageTimeoutSeconds = mkOption {
+        type = types.ints.positive;
+        default = 120;
+        description = "Time limit for rendering and recognising one page or image.";
+      };
+    };
+
     logLevel = mkOption {
       type = types.enum [
         "debug"
@@ -203,6 +245,10 @@ in
       {
         assertion = cfg.listen.public == null || (cfg.oauth != null && cfg.publicUrl != null);
         message = "services.my-memory: the public listener needs oauth and publicUrl";
+      }
+      {
+        assertion = !cfg.ocr.enable || cfg.ocr.languages != [ ];
+        message = "services.my-memory: ocr.languages must name at least one language";
       }
     ];
 

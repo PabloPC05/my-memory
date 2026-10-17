@@ -27,7 +27,7 @@ How my-memory works inside, for people who want to run it, change it or build so
            git remote (Forgejo, or any git server) + LFS store
 ```
 
-- **Stack:** TypeScript on Node.js 24; the official `@modelcontextprotocol/sdk` for the Streamable HTTP transport and the OAuth helpers; express; the built-in `node:sqlite` (FTS5, WAL); the `git`, `git-lfs` and `pdftotext` binaries called with `execFile`, never through a shell.
+- **Stack:** TypeScript on Node.js 24; the official `@modelcontextprotocol/sdk` for the Streamable HTTP transport and the OAuth helpers; express; the built-in `node:sqlite` (FTS5, WAL); the `git`, `git-lfs`, `pdftotext`, `pdftoppm` and `tesseract` binaries called with `execFile`, never through a shell.
 - **Two listeners.** The listener a request arrives on decides which credentials it accepts, without trusting proxy headers. The public one, meant to sit behind a reverse proxy, accepts only OAuth access tokens, so a leaked static token is useless from the internet; it has no uploads or webhook. Both listeners are optional: a setup with only local clients runs the private one alone.
 
 ## Notes
@@ -102,7 +102,13 @@ Every write goes through one in-process queue. Reads take no lock: SQLite runs i
 
 ## Attachments
 
-Binaries go to git LFS: `attach` adds the LFS rule for the extension to `.gitattributes` the first time it is needed. Next to each binary goes a companion note with its title, description, an embed and, for PDFs, the text from `pdftotext`, one section per page. A PDF that yields almost no text is treated as a scan: the note says so and the call returns `EXTRACTION_EMPTY`. Large files are uploaded first with a streaming `PUT /uploads/:filename` on the private listener (no size limit beyond free disk space) and attached by `upload_id`.
+Binaries go to git LFS: `attach` adds the LFS rule for the extension to `.gitattributes` the first time it is needed. Next to each binary goes a companion note with its title, description, an embed and, for PDFs, the text from `pdftotext`, one section per page (`page_heading`). The frontmatter's `extracted_with` says where the text came from (`pdftotext`, `ocr` or `none`).
+
+- **OCR, optional and local.** A PDF that yields almost no text (under 20 characters per page) is treated as a scan. If OCR is available, it is OCR'd page by page: `pdftoppm` renders each page to a PNG at 300 dpi in its own temp dir, `tesseract` reads it with the configured languages (`[ocr] languages`, e.g. `spa+eng`), and the temp dir is removed right after, whatever happens. Pages keep their numbers and their sections; the note starts with a line saying the text comes from OCR (`ocr_notice` in `memory.toml`). Only the first `max_pages` pages are OCR'd and a page that fails or times out (`page_timeout_seconds`) is skipped; either way the call returns `EXTRACTION_PARTIAL`. Images (`png`, `jpg`, `jpeg`, `webp`, `tif`, `tiff`) are OCR'd with `tesseract` too, their text right under the embed (sections only for multi-page TIFFs).
+- **Fallback.** When OCR is disabled, the tools are missing or OCR finds nothing either, the note keeps just the embed and the call returns `EXTRACTION_EMPTY` with the reason (e.g. "OCR unavailable: tesseract is not installed"); other file types get `EXTRACTION_EMPTY` as before. The tools and the installed languages are probed once at startup and logged (`ocr.tools`); requested languages that are not installed are dropped, and a missing tool never stops the server.
+- **Extraction runs before the write lock**, on the uploaded file only, so a slow OCR never blocks other writes.
+
+Large files are uploaded first with a streaming `PUT /uploads/:filename` on the private listener (no size limit beyond free disk space) and attached by `upload_id`.
 
 ## Authentication
 

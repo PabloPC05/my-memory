@@ -48,6 +48,10 @@ self:
     machine.succeed("systemctl start my-memory")
     machine.wait_for_open_port(8782)
 
+    # OCR tools are found at startup (tesseract with spa+eng, pdftoppm).
+    machine.succeed("journalctl -u my-memory -o cat | grep ocr.tools | grep -F '\"pdf\":true,\"image\":true'")
+    machine.succeed("journalctl -u my-memory -o cat | grep ocr.tools | grep -F '\"languages\":\"spa+eng\"'")
+
     def call(body):
         return machine.succeed(
             "curl -sf http://127.0.0.1:8782/mcp "

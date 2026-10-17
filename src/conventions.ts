@@ -27,6 +27,8 @@ export interface Conventions {
 	attachments: {
 		/** Heading of each extracted page in a companion note; `{n}` is the page number. */
 		pageHeading: string;
+		/** Line put in a companion note whose text comes from OCR; `{languages}` is replaced. */
+		ocrNotice: string;
 	};
 	relations: {
 		/** Relation keys agents may use in `key:: [[x]]`, lowercase; `null` means any. */
@@ -46,7 +48,7 @@ export function defaultConventions(): Conventions {
 			maxDescription: 200,
 		},
 		instructions: { file: "AGENTS.md" },
-		attachments: { pageHeading: "Page {n}" },
+		attachments: { pageHeading: "Page {n}", ocrNotice: "Text recognised with OCR ({languages}); it may contain errors." },
 		relations: { allowed: null },
 	};
 }
@@ -109,6 +111,10 @@ export function parseConventions(text: string): Conventions {
 	if (attachments.page_heading !== undefined) {
 		if (typeof attachments.page_heading !== "string" || !attachments.page_heading.includes("{n}")) throw new Error("attachments.page_heading must be a string containing {n}");
 		c.attachments.pageHeading = attachments.page_heading;
+	}
+	if (attachments.ocr_notice !== undefined) {
+		if (typeof attachments.ocr_notice !== "string" || !attachments.ocr_notice.trim()) throw new Error("attachments.ocr_notice must be a non-empty string");
+		c.attachments.ocrNotice = attachments.ocr_notice.trim();
 	}
 
 	const relations = table(doc.relations, "relations");

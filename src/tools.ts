@@ -234,7 +234,7 @@ export async function createMcpServer(memory: MemoryService, client: ClientIdent
 		{
 			title: "Attach a file",
 			description:
-				"Stores a binary (PDF, image…) with git LFS and creates a companion note next to it with its text (PDFs) so it can be searched. Send the bytes as base64 for small files, or upload first with PUT /uploads/<filename> and pass upload_id.",
+				"Stores a binary (PDF, image…) with git LFS and creates a companion note next to it with its text so it can be searched: PDFs via pdftotext, and scanned PDFs and images (png, jpg, webp, tiff) via OCR when the server has it. Send the bytes as base64 for small files, or upload first with PUT /uploads/<filename> and pass upload_id.",
 			inputSchema: {
 				path: z.string().describe("Where the file goes, e.g. «temas/escritura-casa.pdf»."),
 				upload_id: z.string().optional(),
