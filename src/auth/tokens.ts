@@ -52,6 +52,11 @@ export class TokenStore {
 		return this.tokens.find((t) => safeEqual(t.hash, hash)) ?? null;
 	}
 
+	/** Id, name and scope of every token; never the hash. */
+	list(): Omit<StaticToken, "hash">[] {
+		return this.tokens.map(({ hash: _, ...t }) => t);
+	}
+
 	get count(): number {
 		return this.tokens.length;
 	}

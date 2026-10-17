@@ -2,8 +2,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { MemoryError } from "./errors.js";
+import type { ClientsService } from "./clients.js";
 import type { Logger } from "./log.js";
 import type { ClientIdentity, MemoryService } from "./memory.js";
+import { SETUP_GUIDE_URI, setupGuide } from "./setup-guide.js";
 
 export const SERVER_NAME = "my-memory";
 export const SERVER_VERSION = "0.1.0";
@@ -23,7 +25,7 @@ function fail(error: unknown): CallToolResult {
 }
 
 /** A fresh MCP server per request (stateless transport), with the tools this client's scope allows. */
-export async function createMcpServer(memory: MemoryService, client: ClientIdentity, log: Logger): Promise<McpServer> {
+export async function createMcpServer(memory: MemoryService, client: ClientIdentity, log: Logger, clients: ClientsService | null = null): Promise<McpServer> {
 	const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: await memory.instructions() });
 
 	const wrap =
@@ -120,6 +122,35 @@ export async function createMcpServer(memory: MemoryService, client: ClientIdent
 		},
 		wrap("history", (a: { path?: string; name?: string; limit?: number }) => memory.history(a)),
 	);
+
+	if (clients) {
+		server.registerTool(
+			"clients",
+			{
+				title: "Connected clients",
+				description:
+					"Every client that can use this memory (static tokens and OAuth apps, plus ids seen in the history): scope, when it was last seen and with which tool, how many writes it made in the last 7 and 30 days and when the last one was, and the latest `memory-setup <version>` record it left in the notes. Never returns tokens.",
+				inputSchema: {},
+				annotations: read,
+			},
+			wrap("clients", () => clients.report()),
+		);
+	}
+
+	const guide = setupGuide();
+	if (guide) {
+		server.registerPrompt(
+			"setup",
+			{ title: "Set up this memory on your host", description: "Step-by-step guide for an agent to install this memory on the host it runs in (import what it knows, make this the only place it saves durable knowledge)." },
+			() => ({ messages: [{ role: "user", content: { type: "text", text: guide } }] }),
+		);
+		server.registerResource(
+			"agent-setup",
+			SETUP_GUIDE_URI,
+			{ title: "Set up this memory on your host", description: "The agent setup guide, in Markdown (same text as the `setup` prompt).", mimeType: "text/markdown" },
+			(uri) => ({ contents: [{ uri: uri.href, mimeType: "text/markdown", text: guide }] }),
+		);
+	}
 
 	if (client.scope !== "write") return server;
 

@@ -33,6 +33,7 @@ The agent reads [the setup guide](docs/agent-setup.md) and installs your memory 
 | `read` | A note or one section, with its `hash`; `revision` reads an old version |
 | `links` | Outgoing `[[links]]` (broken ones included) and backlinks with context, optionally only one relation |
 | `history` | Commits that touched a note: who, when, why |
+| `clients` | Who is connected: every token and OAuth app with last seen (time and tool), writes in the last 7 and 30 days, and the `memory-setup` version it left in the notes. Never returns secrets |
 | `create` | New note; unique names across folders; refuses look-alike duplicates unless `confirm_new` |
 | `edit` | Exact text replacements, all or nothing |
 | `write` | Rewrite a whole note; needs the `hash` you read |
@@ -40,7 +41,9 @@ The agent reads [the setup guide](docs/agent-setup.md) and installs your memory 
 | `delete` | Remove a note (it stays in history); refused while other notes link to it |
 | `attach` | Store a file in LFS with a searchable companion note |
 
-Clients with a read-only token only see the first five.
+Clients with a read-only token only see the first five and `clients`.
+
+The server also offers the agent setup guide to every connected client, offline (it ships with the package): as the MCP prompt `setup` ("Set up this memory on your host") and as the resource `memory://agent-setup`, both with the Markdown of [docs/agent-setup.md](docs/agent-setup.md). The server instructions mention them, so an agent that finds itself on an unconfigured host can follow them without being given the URL.
 
 ## Notes format
 
@@ -92,7 +95,10 @@ Requirements: Node.js 24, git, git-lfs, and poppler's `pdftotext` (optional).
 npm ci && npm run build
 my-memory token add laptop --name "Claude Code (laptop)" --scope write --file tokens.toml
 my-memory serve --config config.toml
+my-memory clients --config config.toml     # who is connected: last seen, writes, setup version (--json for scripts)
 ```
+
+Last-seen times are kept in `activity.sqlite` in the data dir (written at most once a minute per client; it is not in the notes repo) and the write counts come from the `Client:` trailers of the git history.
 
 `config.toml`:
 

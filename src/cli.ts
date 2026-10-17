@@ -3,7 +3,9 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { ForgejoOAuthProvider } from "./auth/oauth.js";
 import { addToken, listTokens, revokeToken } from "./auth/tokens.js";
+import { buildClientsReport, ClientActivity, renderClientsTable } from "./clients.js";
 import { loadConfig } from "./config.js";
+import { Git } from "./git.js";
 import { jsonLogger } from "./log.js";
 import { MemoryService } from "./memory.js";
 import { applyMigration, planMigration, renderPlan } from "./migrate.js";
@@ -18,6 +20,7 @@ Usage:
   my-memory token revoke <id> (--config <file> | --file <tokens.toml>)
   my-memory oauth list --config <file>
   my-memory oauth revoke <client_id|all> --config <file>
+  my-memory clients [--json] --config <file>   who is connected: last seen, writes, setup version
   my-memory reindex --config <file>          full rebuild of the index (stop the service first)
   my-memory migrate <repo-dir> [--apply] [--conventions <memory.toml>]
 
@@ -43,6 +46,7 @@ export async function main(argv: string[]): Promise<number> {
 			scope: { type: "string" },
 			apply: { type: "boolean" },
 			conventions: { type: "string" },
+			json: { type: "boolean" },
 			help: { type: "boolean", short: "h" },
 		},
 	});
@@ -113,6 +117,26 @@ export async function main(argv: string[]): Promise<number> {
 				throw new Error("oauth: list or revoke");
 			} finally {
 				provider.close();
+			}
+		}
+		if (command === "clients") {
+			if (!values.config) throw new Error("clients needs --config");
+			const config = loadConfig(values.config, { secrets: false });
+			const repoDir = join(config.dataDir, "repo");
+			const provider = config.oauth && config.publicUrl ? new ForgejoOAuthProvider(join(config.dataDir, "state.sqlite"), { ...config.oauth, publicUrl: config.publicUrl }) : null;
+			try {
+				const report = await buildClientsReport({
+					git: new Git(repoDir),
+					repoDir,
+					staticClients: () => (config.tokensFile ? listTokens(config.tokensFile) : []),
+					oauthClients: () => provider?.listClients() ?? [],
+					activity: () => ClientActivity.snapshot(join(config.dataDir, "activity.sqlite")),
+				});
+				process.stdout.write(`${values.json ? JSON.stringify(report, null, 2) : renderClientsTable(report)}
+`);
+				return 0;
+			} finally {
+				provider?.close();
 			}
 		}
 		if (command === "reindex") {

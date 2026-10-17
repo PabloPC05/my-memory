@@ -26,4 +26,12 @@ https://raw.githubusercontent.com/PabloPC05/my-memory/main/docs/agent-setup.md
 
 El agente lee [la guía de instalación](docs/agent-setup.md) y se instala la memoria él solo: la encuentra entre sus herramientas, te propone importar lo que ya sabe de ti, instala sus instrucciones permanentes y, donde la plataforma lo permite (Claude Code, tus propios agentes), le impide guardar en otro sitio. Te pide un único permiso antes de cambiar nada. Inspirado en la página de instalación para agentes de Notion.
 
+## Quién está conectado
+
+La herramienta de solo lectura `clients` (disponible también para tokens de lectura) y el comando `my-memory clients --config config.toml` (`--json` para scripts) listan cada token y cada app OAuth con cuándo se vio por última vez y con qué herramienta, sus escrituras en los últimos 7 y 30 días (de los trailers `Client:` de git) y la versión `memory-setup` que dejó anotada en las notas. Las horas de última conexión se guardan en `activity.sqlite`, en el directorio de datos y no en el repo de notas. Nunca devuelve tokens ni hashes.
+
+## La guía de instalación, desde el servidor
+
+El servidor ofrece a todo cliente conectado la guía de instalación, también sin conexión (va dentro del paquete): como prompt MCP `setup` («Set up this memory on your host») y como recurso `memory://agent-setup`. Las instrucciones del servidor las mencionan, así que el agente no necesita que le des la URL.
+
 Licencia Apache-2.0.
