@@ -35,6 +35,7 @@ El agente lee [la guía de instalación](docs/agent-setup.md) y se instala tu me
 | `read` | Una nota o una sección, con su `hash`; `revision` lee una versión antigua |
 | `links` | Enlaces `[[...]]` salientes (también los rotos) y retroenlaces con contexto, opcionalmente solo una relación |
 | `history` | Commits que tocaron una nota: quién, cuándo, por qué |
+| `lint` | Lista de mantenimiento, lo más grave primero: frontmatter roto y notas sustituidas fuera del archivo, enlaces rotos, posibles duplicados, deducciones antiguas, páginas que faltan, menciones sin enlace, notas huérfanas, sin tocar hace mucho o demasiado grandes. Cuenta por tipo; filtra por `kinds`, `folder` y `limit` |
 | `clients` | Quién está conectado: cada token y app OAuth con su última conexión (hora y herramienta), escrituras en los últimos 7 y 30 días y la versión de `memory-setup` que dejó anotada en las notas. Nunca devuelve secretos |
 | `create` | Nota nueva; nombres únicos entre carpetas; rechaza duplicados parecidos salvo `confirm_new` |
 | `edit` | Reemplazos de texto exactos, todos o ninguno |
@@ -43,7 +44,9 @@ El agente lee [la guía de instalación](docs/agent-setup.md) y se instala tu me
 | `delete` | Borra una nota (queda en el historial); se rechaza mientras otras notas la enlacen |
 | `attach` | Guarda un archivo en LFS con una nota al lado en la que se puede buscar |
 
-Los clientes con un token de solo lectura ven solo las cinco primeras y `clients`.
+Los clientes con un token de solo lectura ven solo las cinco primeras, `lint` y `clients`.
+
+`lint` es la mitad barata de mantener la memoria en orden (la «wiki para LLM» de Karpathy: ingerir, responder, revisar). Sale del índice y de las fechas de git en milisegundos, sin modelo, así que el agente recibe candidatos en vez de leerse todas las notas; juzgarlos (¿es una contradicción?, ¿sigue valiendo esa deducción?, ¿fusionar o enlazar?) es la mitad del agente. Más en [docs/design.md](docs/design.md#lint).
 
 El servidor también ofrece la guía de instalación para agentes a todo cliente conectado, sin conexión (va dentro del paquete): como prompt MCP `setup` («Set up this memory on your host») y como recurso `memory://agent-setup`, ambos con el Markdown de [docs/agent-setup.md](docs/agent-setup.md). Las instrucciones del servidor los mencionan, así que un agente que se encuentre en una plataforma sin configurar puede seguirlos sin que le des la URL.
 
@@ -87,6 +90,16 @@ page_heading = "Page {n}"
 
 [relations]
 allowed = ["works_at", "lives_with"]  # avisa con otras claves; sin esto, se sugieren las que estén en uso
+
+[lint]
+exclude            = []            # carpetas que no se revisan (la raíz y la carpeta de archivo nunca se revisan)
+orphan_exclude     = ["me"]        # nunca se avisan como huérfanas; por defecto, folders.index_full
+stale_days         = 180           # sin cambios más tiempo → stale
+inference_days     = 90            # «(deducido, 2026-01-31)» más antiguo → old_inference
+inferred_markers   = ["deducido"]  # palabras de procedencia que marcan una deducción
+max_bytes          = 16384         # más grande → oversized (las notas de adjuntos no cuentan)
+missing_page_min   = 2             # un destino que no existe enlazado desde tantas notas → missing_page
+mention_min_length = 4             # nombre o alias más corto que se busca como mención sin enlace
 ```
 
 ## Ponerlo en marcha
@@ -98,6 +111,7 @@ npm ci && npm run build
 my-memory token add laptop --name "Claude Code (laptop)" --scope write --file tokens.toml
 my-memory serve --config config.toml
 my-memory clients --config config.toml     # quién está conectado: última conexión, escrituras, versión de la guía (--json para scripts)
+my-memory lint --config config.toml        # lista de mantenimiento (--json, --kind stale,orphan, --folder, --limit)
 ```
 
 Las horas de última conexión se guardan en `activity.sqlite`, en el directorio de datos (como mucho una vez por minuto y cliente; no está en el repo de notas), y el número de escrituras sale de los trailers `Client:` del historial de git.

@@ -32,6 +32,24 @@ export interface Conventions {
 		/** Relation keys agents may use in `key:: [[x]]`, lowercase; `null` means any. */
 		allowed: string[] | null;
 	};
+	lint: {
+		/** Folders left out of every lint check (the archive and root files always are). */
+		exclude: string[];
+		/** Folders whose notes are not reported as orphans; defaults to `folders.index_full`. */
+		orphanExclude: string[];
+		/** A note unchanged for more days than this is `stale`. */
+		staleDays: number;
+		/** An inference marker older than this many days is `old_inference`. */
+		inferenceDays: number;
+		/** Words of the provenance marker that flags an inference: `(deducido)` or `(deducido, 2026-01-31)`. */
+		inferredMarkers: string[];
+		/** Notes larger than this many bytes are `oversized` (attachment companions are exempt). */
+		maxBytes: number;
+		/** A missing target linked from at least this many notes is a `missing_page` rather than a `broken_link`. */
+		missingPageMin: number;
+		/** Shortest label (normalized characters) looked for as an `unlinked_mention`. */
+		mentionMinLength: number;
+	};
 }
 
 export const CONVENTIONS_FILE = "memory.toml";
@@ -48,6 +66,7 @@ export function defaultConventions(): Conventions {
 		instructions: { file: "AGENTS.md" },
 		attachments: { pageHeading: "Page {n}" },
 		relations: { allowed: null },
+		lint: { exclude: [], orphanExclude: [], staleDays: 180, inferenceDays: 90, inferredMarkers: ["deducido"], maxBytes: 16_384, missingPageMin: 2, mentionMinLength: 4 },
 	};
 }
 
@@ -113,5 +132,19 @@ export function parseConventions(text: string): Conventions {
 
 	const relations = table(doc.relations, "relations");
 	if (relations.allowed !== undefined) c.relations.allowed = stringList(relations.allowed, "relations.allowed", (v) => RELATION_KEY.test(v)).map((v) => v.toLowerCase());
+
+	const lint = table(doc.lint, "lint");
+	if (lint.exclude !== undefined) c.lint.exclude = stringList(lint.exclude, "lint.exclude", (v) => FOLDER.test(v));
+	c.lint.orphanExclude = lint.orphan_exclude !== undefined ? stringList(lint.orphan_exclude, "lint.orphan_exclude", (v) => FOLDER.test(v)) : c.folders.indexFull;
+	if (lint.inferred_markers !== undefined) c.lint.inferredMarkers = stringList(lint.inferred_markers, "lint.inferred_markers", (v) => /^[\p{L}\p{N} _-]+$/u.test(v));
+	const positive = (key: string, value: unknown): number => {
+		if (typeof value !== "number" || !Number.isInteger(value) || value < 1) throw new Error(`lint.${key} must be a positive integer`);
+		return value;
+	};
+	if (lint.stale_days !== undefined) c.lint.staleDays = positive("stale_days", lint.stale_days);
+	if (lint.inference_days !== undefined) c.lint.inferenceDays = positive("inference_days", lint.inference_days);
+	if (lint.max_bytes !== undefined) c.lint.maxBytes = positive("max_bytes", lint.max_bytes);
+	if (lint.missing_page_min !== undefined) c.lint.missingPageMin = positive("missing_page_min", lint.missing_page_min);
+	if (lint.mention_min_length !== undefined) c.lint.mentionMinLength = positive("mention_min_length", lint.mention_min_length);
 	return c;
 }

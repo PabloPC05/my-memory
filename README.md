@@ -35,6 +35,7 @@ The agent reads [the setup guide](docs/agent-setup.md) and installs your memory 
 | `read` | A note or one section, with its `hash`; `revision` reads an old version |
 | `links` | Outgoing `[[links]]` (broken ones included) and backlinks with context, optionally only one relation |
 | `history` | Commits that touched a note: who, when, why |
+| `lint` | Maintenance worklist, worst first: bad frontmatter and superseded notes outside the archive, broken links, look-alike duplicates, old inferences, missing pages, unlinked mentions, orphans, stale and oversized notes. Counts per kind; filter by `kinds`, `folder`, `limit` |
 | `clients` | Who is connected: every token and OAuth app with last seen (time and tool), writes in the last 7 and 30 days, and the `memory-setup` version it left in the notes. Never returns secrets |
 | `create` | New note; unique names across folders; refuses look-alike duplicates unless `confirm_new` |
 | `edit` | Exact text replacements, all or nothing |
@@ -43,7 +44,9 @@ The agent reads [the setup guide](docs/agent-setup.md) and installs your memory 
 | `delete` | Remove a note (it stays in history); refused while other notes link to it |
 | `attach` | Store a file in LFS with a searchable companion note |
 
-Clients with a read-only token only see the first five and `clients`.
+Clients with a read-only token only see the first five, `lint` and `clients`.
+
+`lint` is the cheap half of keeping the memory tidy (Karpathy's "LLM wiki": ingest, answer, lint). It is computed from the index and git dates in milliseconds, without a model, so the agent gets candidates instead of reading every note; judging them (is this a contradiction, does that inference still hold, merge or link?) is the agent's half. See [docs/design.md](docs/design.md#lint).
 
 The server also offers the agent setup guide to every connected client, offline (it ships with the package): as the MCP prompt `setup` ("Set up this memory on your host") and as the resource `memory://agent-setup`, both with the Markdown of [docs/agent-setup.md](docs/agent-setup.md). The server instructions mention them, so an agent that finds itself on an unconfigured host can follow them without being given the URL.
 
@@ -87,6 +90,16 @@ page_heading = "Page {n}"
 
 [relations]
 allowed = ["works_at", "lives_with"]  # warn on other keys; without it, keys in use are suggested
+
+[lint]
+exclude            = []            # folders left out of every check (root files and the archive always are)
+orphan_exclude     = ["me"]        # never reported as orphans; defaults to folders.index_full
+stale_days         = 180           # unchanged for longer → stale
+inference_days     = 90            # "(deducido, 2026-01-31)" older than this → old_inference
+inferred_markers   = ["deducido"]  # provenance words that mark an inference
+max_bytes          = 16384         # bigger → oversized (attachment notes are exempt)
+missing_page_min   = 2             # a missing target linked from this many notes → missing_page
+mention_min_length = 4             # shortest name or alias looked for as an unlinked mention
 ```
 
 ## Running it
@@ -98,6 +111,7 @@ npm ci && npm run build
 my-memory token add laptop --name "Claude Code (laptop)" --scope write --file tokens.toml
 my-memory serve --config config.toml
 my-memory clients --config config.toml     # who is connected: last seen, writes, setup version (--json for scripts)
+my-memory lint --config config.toml        # maintenance worklist (--json, --kind stale,orphan, --folder, --limit)
 ```
 
 Last-seen times are kept in `activity.sqlite` in the data dir (written at most once a minute per client; it is not in the notes repo) and the write counts come from the `Client:` trailers of the git history.

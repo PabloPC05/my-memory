@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { MemoryError } from "./errors.js";
+import { LINT_KINDS } from "./lint.js";
 import type { ClientsService } from "./clients.js";
 import type { Logger } from "./log.js";
 import type { ClientIdentity, MemoryService } from "./memory.js";
@@ -121,6 +122,22 @@ export async function createMcpServer(memory: MemoryService, client: ClientIdent
 			annotations: read,
 		},
 		wrap("history", (a: { path?: string; name?: string; limit?: number }) => memory.history(a)),
+	);
+
+	server.registerTool(
+		"lint",
+		{
+			title: "Maintenance worklist",
+			description:
+				"Structural candidates for maintaining the memory, computed from the index without reading every note, worst first: problems (bad frontmatter, superseded notes outside the archive), broken_link, duplicate_candidates, old_inference (statements marked as inferred long ago), missing_page (a missing target linked from several notes), unlinked_mention (a note's name in plain text without a [[link]]), orphan (nothing links to it), stale (unchanged for long), oversized. Each item has the notes, a kind and a short detail; `counts` has the totals. It only finds candidates: read the notes and decide (merge, link, update, archive, split) before writing.",
+			inputSchema: {
+				kinds: z.array(z.enum(LINT_KINDS)).optional().describe("Only these kinds (default all)."),
+				folder: z.string().optional().describe("Only items that involve a note in this top-level folder."),
+				limit: z.number().int().min(1).max(500).optional().describe("Default 50."),
+			},
+			annotations: read,
+		},
+		wrap("lint", (a: { kinds?: string[]; folder?: string; limit?: number }) => memory.lint(a)),
 	);
 
 	if (clients) {
