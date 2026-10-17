@@ -13,6 +13,7 @@ Una memoria autoalojada para agentes de IA. Tus notas son una carpeta de Markdow
 - **Dos puertas de entrada.** Un listener privado para tokens fijos por cliente, subida de archivos y el webhook de git. Un listener público que solo acepta tokens OAuth 2.1 (registro dinámico de clientes y PKCE, con el inicio de sesión delegado en Forgejo) para clientes remotos como claude.ai.
 - **Adjuntos.** Los binarios van a git LFS con una nota al lado que contiene su texto (los PDF, con `pdftotext`), así que también se encuentran al buscar.
 - **Enlaces con tipo.** `works_at:: [[acme]]` dice qué significa un enlace, y `links` puede filtrar por él.
+- **Búsqueda por significado, opcional.** Apunta `[embeddings]` a cualquier endpoint de embeddings compatible con OpenAI (Ollama o llama.cpp en la misma CPU, TEI, OpenAI…) y `search` combina el texto completo con la similitud de vectores, así que «coche» encuentra la nota que dice «vehículo». Dentro del servidor no corre ningún modelo y no hace falta GPU; sin él, la búsqueda es solo de texto completo.
 
 Cómo funciona por dentro (índice, flujo de escritura, concurrencia, autenticación): [docs/design.md](docs/design.md).
 
@@ -31,7 +32,7 @@ El agente lee [la guía de instalación](docs/agent-setup.md) y se instala tu me
 | Herramienta | Qué hace |
 |---|---|
 | `list` | Índice corto, o todas las notas de una carpeta con descripción, alias y último cambio |
-| `search` | Búsqueda de texto completo por secciones (sin distinguir acentos, los prefijos coinciden) con fragmentos |
+| `search` | Búsqueda de texto completo por secciones (sin distinguir acentos, los prefijos coinciden) con fragmentos; híbrida con búsqueda por significado si hay `[embeddings]` |
 | `read` | Una nota o una sección, con su `hash`; `revision` lee una versión antigua |
 | `links` | Enlaces `[[...]]` salientes (también los rotos) y retroenlaces con contexto, opcionalmente solo una relación |
 | `history` | Commits que tocaron una nota: quién, cuándo, por qué |
@@ -129,6 +130,16 @@ forgejo_internal_url = "http://127.0.0.1:3000"  # como lo ve el servidor
 client_id_file = "oauth-client-id"              # una app OAuth2 registrada en Forgejo,
 client_secret_file = "oauth-client-secret"      # URI de redirección <public_url>/oauth/callback
 allowed_users = ["me"]
+
+[embeddings]                                    # opcional: búsqueda por significado; omítelo para solo texto completo
+url = "http://127.0.0.1:11434/v1/embeddings"    # cualquier endpoint compatible con OpenAI (Ollama, llama.cpp, TEI, OpenAI…)
+model = "nomic-embed-text"
+# api_key_file = "embeddings-key"               # se envía como token Bearer, si el endpoint lo pide
+# dimensions = 512                              # para modelos que pueden acortar su salida
+# batch_size = 32
+# timeout_seconds = 60
+query_prefix = "search_query: "                 # algunos modelos quieren marcadas sus entradas (nomic, e5)
+document_prefix = "search_document: "
 ```
 
 Subidas para `attach`: `curl -T file.pdf -H "Authorization: Bearer $TOKEN" http://host:8782/uploads/file.pdf` devuelve un `upload_id`. No hay límite de tamaño.
@@ -150,6 +161,18 @@ Subidas para `attach`: `curl -T file.pdf -H "Authorization: Bearer $TOKEN" http:
 ```
 
 Tras `my-memory token add … --file <tokensFile>`, ejecuta `systemctl reload my-memory`.
+
+Para la búsqueda por significado, añade `embeddings = { url = "http://127.0.0.1:11434/v1/embeddings"; model = "nomic-embed-text"; queryPrefix = "search_query: "; documentPrefix = "search_document: "; };` (con `apiKeyFile` si el endpoint pide clave), por ejemplo junto a `services.ollama`.
+
+### Búsqueda por significado
+
+Con `[embeddings]`, cada sección de cada nota recibe un vector del endpoint, que se guarda en `index.sqlite`. Entonces `search` acepta `mode`: `hybrid` (por defecto) combina el ranking de texto completo y el de vectores con Reciprocal Rank Fusion, `text` es la búsqueda de texto completo de siempre y `semantic` usa solo los vectores. La respuesta tiene la misma forma de siempre.
+
+- **Las escrituras nunca lo esperan.** Las secciones se procesan en segundo plano después de cada commit o sincronización; mientras tanto se encuentran por texto. Solo se vuelven a procesar las secciones cuyo texto cambió, y cambiar `model`, `dimensions` o `document_prefix` las procesa todas otra vez.
+- **Si el endpoint está caído**, las escrituras funcionan como siempre, la búsqueda vuelve al texto completo con un aviso en el log y las secciones pendientes se reintentan con espera creciente.
+- **Estado en el log:** `embeddings.status` al arrancar (modelo, vectores, secciones pendientes), `embeddings.done` tras cada pasada y `embeddings.failed` mientras el endpoint falla.
+- `my-memory reindex` también procesa las secciones que falten; `--reembed` las procesa todas otra vez. Con una clave `credential:` que no puede leer fuera de systemd, se salta los embeddings y los hace el servicio al arrancar.
+- En un servidor pequeño sin GPU, Ollama con `nomic-embed-text` (multilingües: `bge-m3` o `multilingual-e5-small`, los e5 con los prefijos `query: ` y `passage: `) procesa unos miles de secciones en minutos, una sola vez.
 
 ### Conectar clientes
 

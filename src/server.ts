@@ -39,6 +39,7 @@ export async function startServer(config: ServerConfig, log: Logger = jsonLogger
 		pdftotext: config.pdftotext,
 		log,
 		fetchIntervalMs: config.fetchIntervalSeconds > 0 ? config.fetchIntervalSeconds * 1000 : undefined,
+		embeddings: config.embeddings,
 	});
 	await memory.start();
 	const tokens = new TokenStore(config.tokensFile);
@@ -80,6 +81,7 @@ export async function startServer(config: ServerConfig, log: Logger = jsonLogger
 		private: config.listen.private ? `${config.listen.private.address}:${config.listen.private.port}` : null,
 		tokens: tokens.count,
 		oauth: Boolean(oauth),
+		embeddings: config.embeddings ? config.embeddings.model : null,
 	});
 	return {
 		memory,

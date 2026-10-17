@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { parse as parseToml } from "smol-toml";
+import type { EmbeddingsConfig } from "./embeddings.js";
 import type { Level } from "./log.js";
 
 export interface Listen {
@@ -27,6 +28,8 @@ export interface ServerConfig {
 		refreshTtlSeconds: number;
 	} | null;
 	fetchIntervalSeconds: number;
+	/** Optional semantic search; null keeps search full-text only. */
+	embeddings: (EmbeddingsConfig & { apiKeyFile: string | null }) | null;
 	pdftotext: string;
 	logLevel: Level;
 }
@@ -51,6 +54,37 @@ function readSecret(value: unknown, key: string, base: string, read = true): str
 	const text = readFileSync(secretPath(value, base), "utf8").trim();
 	if (!text) throw new Error(`${key}: the file is empty`);
 	return text;
+}
+
+/** Reads a secret named in the config (a path or `credential:NAME`); for the CLI, which loads configs without secrets. */
+export function readSecretFile(value: string): string {
+	const text = readFileSync(secretPath(value, process.cwd()), "utf8").trim();
+	if (!text) throw new Error(`${value}: the file is empty`);
+	return text;
+}
+
+function num(v: unknown, key: string, fallback: number, min: number): number {
+	if (v === undefined) return fallback;
+	if (typeof v !== "number" || !Number.isFinite(v) || v < min) throw new Error(`${key} must be a number >= ${min}`);
+	return v;
+}
+
+function embeddings(t: Record<string, unknown> | undefined, base: string, read: boolean): ServerConfig["embeddings"] {
+	if (!t) return null;
+	const url = str(t.url, "embeddings.url");
+	if (!/^https?:\/\//.test(url)) throw new Error("embeddings.url must be an http(s) URL");
+	const keyFile = t.api_key_file === undefined ? null : str(t.api_key_file, "embeddings.api_key_file");
+	return {
+		url,
+		model: str(t.model, "embeddings.model"),
+		apiKey: readSecret(t.api_key_file, "embeddings.api_key_file", base, read),
+		apiKeyFile: keyFile === null || keyFile.startsWith("credential:") ? keyFile : secretPath(keyFile, base),
+		dimensions: t.dimensions === undefined ? null : Math.floor(num(t.dimensions, "embeddings.dimensions", 0, 1)),
+		batchSize: Math.floor(num(t.batch_size, "embeddings.batch_size", 32, 1)),
+		timeoutSeconds: num(t.timeout_seconds, "embeddings.timeout_seconds", 60, 1),
+		queryPrefix: t.query_prefix === undefined ? "" : String(t.query_prefix),
+		documentPrefix: t.document_prefix === undefined ? "" : String(t.document_prefix),
+	};
 }
 
 function str(v: unknown, key: string, fallback?: string): string {
@@ -98,6 +132,7 @@ export function loadConfig(file: string, opts: { secrets?: boolean } = {}): Serv
 				}
 			: null,
 		fetchIntervalSeconds: typeof doc.fetch_interval_seconds === "number" ? doc.fetch_interval_seconds : 300,
+		embeddings: embeddings(doc.embeddings as Record<string, unknown> | undefined, base, read),
 		pdftotext: str(doc.pdftotext, "pdftotext", "pdftotext"),
 		logLevel: (["debug", "info", "warn", "error"].includes(doc.log_level as string) ? doc.log_level : "info") as Level,
 	};

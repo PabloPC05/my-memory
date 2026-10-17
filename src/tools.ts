@@ -4,7 +4,7 @@ import { z } from "zod";
 import { MemoryError } from "./errors.js";
 import type { ClientsService } from "./clients.js";
 import type { Logger } from "./log.js";
-import type { ClientIdentity, MemoryService } from "./memory.js";
+import type { ClientIdentity, MemoryService, SearchMode } from "./memory.js";
 import { SETUP_GUIDE_URI, setupGuide } from "./setup-guide.js";
 
 export const SERVER_NAME = "my-memory";
@@ -62,21 +62,25 @@ export async function createMcpServer(memory: MemoryService, client: ClientIdent
 		wrap("list", (a: { folder?: string; include_archive?: boolean; limit?: number; cursor?: string }) => memory.list(a)),
 	);
 
+	// With embeddings configured the tool also searches by meaning; without them it is exactly the full-text search.
+	const semantic = memory.embedder !== null;
 	server.registerTool(
 		"search",
 		{
 			title: "Search notes",
-			description:
-				"Full-text search (accents ignored, word prefixes match). Returns the best sections with a snippet; read the note or the section next. Use quotes for exact phrases. The archive is excluded unless include_archive.",
+			description: semantic
+				? "Hybrid search: full text (accents ignored, word prefixes match) fused with search by meaning, so related words and paraphrases also find notes. Returns the best sections with a snippet; read the note or the section next. Use quotes for exact phrases. The archive is excluded unless include_archive."
+				: "Full-text search (accents ignored, word prefixes match). Returns the best sections with a snippet; read the note or the section next. Use quotes for exact phrases. The archive is excluded unless include_archive.",
 			inputSchema: {
 				query: z.string().describe("Words to look for."),
 				folder: z.string().optional(),
 				include_archive: z.boolean().optional(),
 				limit: z.number().int().min(1).max(50).optional().describe("Default 10."),
+				...(semantic ? { mode: z.enum(["hybrid", "text", "semantic"]).optional().describe("hybrid (default): words and meaning; text: words only; semantic: meaning only.") } : {}),
 			},
 			annotations: read,
 		},
-		wrap("search", (a: { query: string; folder?: string; include_archive?: boolean; limit?: number }) => memory.search(a)),
+		wrap("search", (a: { query: string; folder?: string; include_archive?: boolean; limit?: number; mode?: SearchMode }) => memory.searchAny(a)),
 	);
 
 	server.registerTool(

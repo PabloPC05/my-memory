@@ -33,7 +33,10 @@ let
     optional (cfg.remote != null && cfg.remote.tokenFile != null) "remote-token:${cfg.remote.tokenFile}"
     ++ optional (cfg.webhookSecretFile != null) "webhook-secret:${cfg.webhookSecretFile}"
     ++ optional (cfg.oauth != null) "oauth-client-id:${cfg.oauth.clientIdFile}"
-    ++ optional (cfg.oauth != null) "oauth-client-secret:${cfg.oauth.clientSecretFile}";
+    ++ optional (cfg.oauth != null) "oauth-client-secret:${cfg.oauth.clientSecretFile}"
+    ++ optional (
+      cfg.embeddings != null && cfg.embeddings.apiKeyFile != null
+    ) "embeddings-api-key:${cfg.embeddings.apiKeyFile}";
 
   settings =
     {
@@ -67,6 +70,18 @@ let
         access_ttl_seconds = cfg.oauth.accessTtlSeconds;
         refresh_ttl_seconds = cfg.oauth.refreshTtlSeconds;
       };
+    }
+    // optionalAttrs (cfg.embeddings != null) {
+      embeddings =
+        {
+          inherit (cfg.embeddings) url model;
+          batch_size = cfg.embeddings.batchSize;
+          timeout_seconds = cfg.embeddings.timeoutSeconds;
+          query_prefix = cfg.embeddings.queryPrefix;
+          document_prefix = cfg.embeddings.documentPrefix;
+        }
+        // optionalAttrs (cfg.embeddings.dimensions != null) { inherit (cfg.embeddings) dimensions; }
+        // optionalAttrs (cfg.embeddings.apiKeyFile != null) { api_key_file = "credential:embeddings-api-key"; };
     };
 
   configFile = toml.generate "my-memory.toml" settings;
@@ -171,6 +186,60 @@ in
             refreshTtlSeconds = mkOption {
               type = types.int;
               default = 2592000;
+            };
+          };
+        }
+      );
+    };
+
+    embeddings = mkOption {
+      default = null;
+      description = ''
+        Optional semantic search: an OpenAI-compatible embeddings endpoint (Ollama, llama.cpp server,
+        Hugging Face TEI, OpenAI…). Search then fuses full text with search by meaning; without it
+        search is full-text only.
+      '';
+      type = types.nullOr (
+        types.submodule {
+          options = {
+            url = mkOption {
+              type = types.str;
+              example = "http://127.0.0.1:11434/v1/embeddings";
+              description = "Full URL of the /v1/embeddings endpoint.";
+            };
+            model = mkOption {
+              type = types.str;
+              example = "nomic-embed-text";
+            };
+            apiKeyFile = mkOption {
+              type = types.nullOr types.str;
+              default = null;
+              description = "File with the API key (sent as a Bearer token), if the endpoint needs one.";
+            };
+            dimensions = mkOption {
+              type = types.nullOr types.ints.positive;
+              default = null;
+              description = "Output size to ask for, for models that support it (OpenAI text-embedding-3-*).";
+            };
+            batchSize = mkOption {
+              type = types.ints.positive;
+              default = 32;
+            };
+            timeoutSeconds = mkOption {
+              type = types.ints.positive;
+              default = 60;
+            };
+            queryPrefix = mkOption {
+              type = types.str;
+              default = "";
+              example = "search_query: ";
+              description = "Prepended to search queries (some models, like nomic-embed-text or e5, want it).";
+            };
+            documentPrefix = mkOption {
+              type = types.str;
+              default = "";
+              example = "search_document: ";
+              description = "Prepended to note sections.";
             };
           };
         }
