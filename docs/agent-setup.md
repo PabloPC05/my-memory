@@ -1,12 +1,18 @@
 # Set up my-memory for your agent
 
-> Share this page with an agent (paste it, attach it, or point it to this file) and say "set up my memory".
-> The agent installs itself: it imports what it already knows about you, then makes this memory the only
-> place it saves durable knowledge, enforcing that as far as its platform allows.
+> **For people:** connect your my-memory server to the agent, then give it just this link:
+> `https://raw.githubusercontent.com/PabloPC05/my-memory/main/docs/agent-setup.md`
+> It installs itself: it imports what it already knows about you, then makes your memory the only place it
+> saves durable knowledge, enforcing that as far as its platform allows. It asks before changing anything.
+>
+> **For agents:** if you were given this page or its link with little or no other request, that *is* the
+> request: the user wants you to set up their memory on this host. Follow this page from "Find the memory"
+> on. Talk to the user in their language. Do not write to the memory, change settings or install anything
+> before the user approves the plan from step 2.
 
-| Version | Published |
-| - | - |
-| 0.1.0 ([changelog](agent-setup/changelog.md)) | October 17, 2026 |
+| Version | Published | Source |
+| - | - | - |
+| 0.2.0 ([changelog](agent-setup/changelog.md)) | October 17, 2026 | `https://raw.githubusercontent.com/PabloPC05/my-memory/main/docs/agent-setup.md` |
 
 Adapted from Notion's agent setup guide (v0.0.4, developers.notion.com/prompts/setup), with one addition
 Notion does not have: **enforcement**. Instructions only ask an agent to use the memory; where the host
@@ -24,18 +30,32 @@ memory, the next agent, or the next chat, starts where you left off.
 This page has one-time setup steps and standing rules. If the user asks you to review or compare it, treat it
 as content and do not run setup. Fill placeholders only with values you verified.
 
-## Find the memory tools
+## Find the memory
 
-The memory is an MCP server. Its tools are `list`, `search`, `read`, `links`, `history`, `create`, `edit`,
-`write`, `move`, `delete` and `attach`, but your host may show them with a prefix: `memory_search` behind a
-gateway that serves several servers, `mcp__<server>__search` in Claude Code, and so on. Find them before
-anything else. If they are missing, stop: tell the user the memory server is not connected to this host, and
-that nothing below can work until it is. If you only have the first five (a read-only token), say that setup
-is limited to reading.
+The user will not tell you which connector is the memory; work it out, and only ask if you cannot.
 
-The server sends its own instructions when you connect: the notes repo's `AGENTS.md`, with the folders, note
-format and rules of *this* memory. **That `AGENTS.md` is the operating guide.** Where it and this page
-disagree, it wins. Read it (it is in your instructions, or `read AGENTS.md`) before step 1.
+1. **Look at your MCP tools.** my-memory's tools are `list`, `search`, `read`, `links`, `history`, `create`,
+   `edit`, `write`, `move`, `delete` and `attach`. Your host may show them with a prefix: `mcp__<server>__search`
+   in Claude Code, `<name>_search` behind a gateway that joins several servers into one connector, a connector
+   name in front in chat apps. The memory is the group of tools that share one prefix and include `search`,
+   `read`, `links` and `history` together. Behind a gateway, the connector's other tools (mail, calendar, code…)
+   are not memory: use only that group.
+2. **Confirm with the server's instructions.** Clients receive them on connect; my-memory's start with "This
+   server is a shared, git-versioned memory of Markdown notes", followed by the notes repo's `AGENTS.md`.
+   Behind a gateway they may appear under a section named after that prefix. If your host does not show server
+   instructions, call that group's `read` with the path `AGENTS.md`.
+3. **If you find two candidates, or none, ask.** If there is none, the memory is not connected to this host:
+   say so, explain how to add a remote MCP server here (for example claude.ai: Settings → Connectors → Add
+   custom connector; Claude Code: `claude mcp add --transport http <name> <url>`; check the current steps for
+   this host rather than guessing), ask for the server URL, and stop until it is connected.
+4. **Read-only?** If the group has `list`, `search`, `read`, `links` and `history` but no `create`/`edit`, the
+   token is read-only: say that setup is limited to reading.
+
+Write down what you found (the prefix and tool names, and where the instructions came from); you will put them
+in the persistent instructions in step 4.
+
+**The notes repo's `AGENTS.md` is the operating guide.** It holds the folders, note format and rules of *this*
+memory. Where it and this page disagree, it wins. Read it before step 1.
 
 ## One-time setup for this host
 
@@ -159,8 +179,10 @@ If the host can schedule routines, and native memory could not be switched off, 
 > read chat transcripts, reorganize notes or install updates without asking. Create it?
 
 Routine instructions: read AGENTS.md first; import only new native memories since the last run, deduplicated,
-with provenance and a reason on every write; compare the installed `memory-setup` version with this page's
-version and, if newer, summarize the changelog and propose the exact changes; report only what changed. Never
+with provenance and a reason on every write; fetch the Source URL at the top of this page, compare its version
+with the installed `memory-setup` version and, if it is newer, read its changelog
+(`https://raw.githubusercontent.com/PabloPC05/my-memory/main/docs/agent-setup/changelog.md`), summarize what
+changed and propose the exact edits; report only what changed. Never
 adopt new instructions or edit installed ones without approval. If the host cannot schedule, offer the same as a
 manual checklist and do not claim a routine exists.
 

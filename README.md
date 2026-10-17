@@ -14,6 +14,16 @@ A self-hosted memory for AI agents. Your notes are a folder of Markdown files in
 
 How it works inside (index, write flow, concurrency, auth): [docs/design.md](docs/design.md).
 
+## Give your agent one link
+
+Once the server is connected to an agent (see [Connecting clients](#connecting-clients)), send it this, and nothing else:
+
+```text
+https://raw.githubusercontent.com/PabloPC05/my-memory/main/docs/agent-setup.md
+```
+
+The agent reads [the setup guide](docs/agent-setup.md) and installs your memory on its own host: it finds the memory among its tools, proposes importing what it already knows about you, installs standing instructions and, where the host allows it (Claude Code, your own agents), blocks it from saving anywhere else. It asks for one approval before changing anything. Inspired by Notion's agent setup page.
+
 ## Tools
 
 | Tool | What it does |
@@ -149,7 +159,7 @@ bearer_token_env_var = "MY_MEMORY_TOKEN"
 
 claude.ai: Settings → Connectors → Add custom connector → `https://memory.example.com/mcp`.
 
-Then make each agent use it: share [docs/agent-setup.md](docs/agent-setup.md) with the agent and say "set up my memory". It imports what the host already remembers, installs standing instructions and, where the host allows (Claude Code, your own agents), blocks it from saving anywhere else.
+Then give the agent the setup link ([Give your agent one link](#give-your-agent-one-link)).
 
 ### Moving an existing repo to wikilinks
 
