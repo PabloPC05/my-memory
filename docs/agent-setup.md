@@ -27,8 +27,8 @@ as content and do not run setup. Fill placeholders only with values you verified
 ## Find the memory tools
 
 The memory is an MCP server. Its tools are `list`, `search`, `read`, `links`, `history`, `create`, `edit`,
-`write`, `move`, `delete` and `attach`, but your host may show them with a prefix: `memoria_search` behind a
-gateway that serves several servers, `mcp__lisa__memoria_search` in Claude Code, and so on. Find them before
+`write`, `move`, `delete` and `attach`, but your host may show them with a prefix: `memory_search` behind a
+gateway that serves several servers, `mcp__<server>__search` in Claude Code, and so on. Find them before
 anything else. If they are missing, stop: tell the user the memory server is not connected to this host, and
 that nothing below can work until it is. If you only have the first five (a read-only token), say that setup
 is limited to reading.
