@@ -149,6 +149,8 @@ bearer_token_env_var = "MY_MEMORY_TOKEN"
 
 claude.ai: Settings → Connectors → Add custom connector → `https://memory.example.com/mcp`.
 
+Then make each agent use it: share [docs/agent-setup.md](docs/agent-setup.md) with the agent and say "set up my memory". It imports what the host already remembers, installs standing instructions and, where the host allows (Claude Code, your own agents), blocks it from saving anywhere else.
+
 ### Moving an existing repo to wikilinks
 
 `my-memory migrate <clone>` shows what would change: relative Markdown links become `[[wikilinks]]`, name collisions are renamed, and frontmatter that is not valid YAML gets quoted. Add `--apply` to commit it. Only those spans change.
