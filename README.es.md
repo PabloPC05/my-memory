@@ -26,6 +26,8 @@ https://raw.githubusercontent.com/PabloPC05/my-memory/main/docs/agent-setup.md
 
 El agente lee [la guía de instalación](docs/agent-setup.md) y se instala tu memoria él solo en su plataforma: la encuentra entre sus herramientas, te propone importar lo que ya sabe de ti, instala sus instrucciones permanentes y, donde la plataforma lo permite (Claude Code, tus propios agentes), le impide guardar en cualquier otro sitio. Te pide un único permiso antes de cambiar nada. Inspirado en la página de instalación para agentes de Notion.
 
+En Claude Code también puede instalar, si quieres, un hook que le acerca al agente las notas relevantes sin que tenga que acordarse de buscar (como hace Supermemory): antes de cada mensaje, [`inject-memory.mjs`](docs/agent-setup/claude-code/inject-memory.mjs) busca ese mensaje en tu memoria y añade al turno las mejores coincidencias, presentadas como información que comprobar, no como instrucciones, y con un límite de tamaño pequeño. Necesita `MY_MEMORY_URL` y un `MY_MEMORY_TOKEN` de solo lectura, y no añade nada ante cualquier error o tiempo de espera agotado.
+
 ## Herramientas
 
 | Herramienta | Qué hace |

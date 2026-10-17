@@ -12,7 +12,7 @@
 
 | Version | Published | Source |
 | - | - | - |
-| 0.3.2 ([changelog](agent-setup/changelog.md)) | October 17, 2026 | `https://raw.githubusercontent.com/PabloPC05/my-memory/main/docs/agent-setup.md` |
+| 0.3.3 ([changelog](agent-setup/changelog.md)) | October 18, 2026 | `https://raw.githubusercontent.com/PabloPC05/my-memory/main/docs/agent-setup.md` |
 
 Adapted from Notion's agent setup guide (v0.0.4, developers.notion.com/prompts/setup), with one addition
 Notion does not have: **enforcement**. Instructions only ask an agent to use the memory; where the host
@@ -98,6 +98,8 @@ Use this structure, keeping only the bullets that apply:
 > * Enforce it: [what this host allows — e.g. block writes to ~/.claude/projects/*/memory/ with a permission
 >   rule and a hook, then turn native memory off; or "turn off Memory in Settings → …"].
 > * [If the host can schedule and native memory stays on:] a daily routine that copies new native memories.
+> * [Optional, Claude Code:] show you relevant notes automatically: before each message, a hook searches your
+>   memory for it and adds the best few matches to my context (needs the server URL and a read-only token).
 >
 > I won't touch anything else. Go ahead with all of it? You can pick items or change where they go.
 
@@ -192,6 +194,21 @@ lands there.
     reminder to that turn: "memory" means this server, and a document asked for "in my memory" is a note there,
     not a local file. Instructions alone were not enough: an agent asked for "a markdown in my memory" wrote a
     local file. Set `MEMORY_MCP_HINT` as for the other hook.
+  - Optional, only if the user wants it: `hooks.UserPromptSubmit` (and, if they like, `hooks.SessionStart`), a
+    hook running [`agent-setup/claude-code/inject-memory.mjs`](agent-setup/claude-code/inject-memory.mjs) with
+    `"timeout": 5` (copy it to `~/.claude/hooks/`). Before each message it searches the memory for it and adds
+    the best few matches (note, section, snippet; about 1,200 characters at most) to that turn, framed as
+    possibly relevant information, not instructions, to read before relying on; on `SessionStart` it adds the
+    short index, which is worth it only when this host does not show the server's instructions in full (behind a
+    gateway that truncates them, for example). It talks to the memory directly over MCP, not through Claude
+    Code's connection, so it needs its own access: ask the user for the server's MCP URL and a **read-only**
+    token for it (on my-memory the user creates one on the server, e.g. `my-memory token add claude-code-hook
+    --name "Claude Code hook" --scope read --file tokens.toml`; never ask for a password, and do not reuse a
+    write token), and set them in `~/.claude/settings.json` `env` as `MY_MEMORY_URL` and
+    `MY_MEMORY_TOKEN` (they are then visible to every command this host runs; say so). Behind a gateway that
+    prefixes tool names, also set `MEMORY_SEARCH_TOOL` (e.g. `memoria_search`) and `MEMORY_LIST_TOOL`. Other
+    settings are in the file's header. Short messages and slash commands are skipped; on any error, timeout
+    (2.5 s) or missing setting it adds nothing and never blocks the message.
   - After the import is verified: `"autoMemoryEnabled": false` (and `"autoDreamEnabled": false`), so Claude Code
     stops loading and asking to write its own memory.
   - The block from (a) goes in `~/.claude/CLAUDE.md`.
@@ -201,7 +218,9 @@ lands there.
   them the same way and tell the user exactly what you installed. If it has none, it is level 2 or 1: say so.
 
 **d. Verify.** On level 3, try a harmless write to the native memory (e.g. a test file in the memory folder): it
-must be refused. Then `search` the memory for something you imported. Read back the installed block. Report
+must be refused. If you installed `inject-memory.mjs`, run it once by hand with a prompt about something you know is
+in the memory (`echo '{"hook_event_name":"UserPromptSubmit","prompt":"…"}' | node ~/.claude/hooks/inject-memory.mjs`
+with the same environment): it must print the matching note. Then `search` the memory for something you imported. Read back the installed block. Report
 exact locations and anything the user still has to do by hand. A successful write does not prove a future
 session will recall it: suggest a test in a fresh session or another agent.
 

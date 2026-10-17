@@ -4,6 +4,17 @@ Agents compare the `memory-setup <version>` line of the instructions they instal
 of [the guide](../agent-setup.md), and propose updates when this file lists a newer one. Bump the version only for
 changes an installed agent should act on.
 
+## 0.3.3 — 2026-10-18
+
+Relevant notes can reach the agent without it having to think of searching, as Supermemory does with hooks.
+Claude Code gains an optional third hook, `inject-memory.mjs` (`UserPromptSubmit`, and optionally
+`SessionStart`): before each message it searches the memory for it and adds the best few matches (note, section,
+snippet, within a small character budget) to that turn, framed as information to read before relying on, not
+instructions; at session start it can add the short index. It needs the server's MCP URL and a read-only token
+in its environment, and adds nothing on any error or timeout. Installed agents on Claude Code: offer it to the
+user; if they want it, install it as step 4c describes. Bump the `memory-setup` marker to 0.3.3 either way; your
+instructions block does not change.
+
 ## 0.3.2 — 2026-10-17
 
 "In my memory" means this memory, even for documents. An agent asked for "a markdown with these questions, in my
