@@ -121,6 +121,24 @@ export async function createMcpServer(memory: MemoryService, client: ClientIdent
 		wrap("history", (a: { path?: string; name?: string; limit?: number }) => memory.history(a)),
 	);
 
+	server.registerTool(
+		"recent",
+		{
+			title: "Recent changes",
+			description:
+				"Commits across the whole memory, newest first: who, when, why and which files each one added, modified, deleted or renamed. Use it to catch up on what changed since a date (`since`) or since a commit you saw (`after`), or to find the commit to `revert`.",
+			inputSchema: {
+				since: z.string().optional().describe("Only commits from this date on, e.g. «2026-10-01»."),
+				after: z.string().optional().describe("Only commits after this one (a hash from an earlier `recent` or `history`)."),
+				folder: z.string().optional().describe("Only commits that touched this top-level folder."),
+				limit: z.number().int().min(1).max(100).optional().describe("Default 20."),
+				cursor: z.string().optional().describe("next_cursor from the previous page."),
+			},
+			annotations: read,
+		},
+		wrap("recent", (a: { since?: string; after?: string; folder?: string; limit?: number; cursor?: string }) => memory.recent(a)),
+	);
+
 	if (client.scope !== "write") return server;
 
 	server.registerTool(
@@ -196,6 +214,21 @@ export async function createMcpServer(memory: MemoryService, client: ClientIdent
 			annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
 		},
 		wrap("delete", (a: { path?: string; name?: string; hash: string; reason: string }) => memory.delete(client, a)),
+	);
+
+	server.registerTool(
+		"revert",
+		{
+			title: "Undo a commit",
+			description:
+				"Undoes one earlier change with a new commit (history keeps both), like `git revert`. Find the commit with `recent` or `history`. Fails with REVERT_CONFLICT when later commits changed the same lines (it lists them: revert those first, newest first), with HAS_BACKLINKS if it would remove a note others still link to, and with NAME_TAKEN if a note it would bring back clashes with a newer one.",
+			inputSchema: {
+				commit: z.string().describe("Hash of the commit to undo (full or abbreviated)."),
+				reason,
+			},
+			annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+		},
+		wrap("revert", (a: { commit: string; reason: string }) => memory.revert(client, a)),
 	);
 
 	server.registerTool(

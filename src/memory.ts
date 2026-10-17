@@ -77,6 +77,16 @@ type NoteRef = { path?: string; name?: string };
 
 const READ_ONLY = new MemoryError("FORBIDDEN", "This client has read-only access.");
 
+/** `Key: value` lines from `%(trailers:only=true,unfold=true)`. */
+function parseTrailers(text: string | undefined): Record<string, string> {
+	const trailers: Record<string, string> = {};
+	for (const line of (text ?? "").split("\n")) {
+		const m = /^([\w-]+):\s*(.*)$/.exec(line.trim());
+		if (m) trailers[m[1] as string] = m[2] as string;
+	}
+	return trailers;
+}
+
 /**
  * The memory: a git working clone of the notes repo plus its derived index.
  * Reads go straight to the files and the index; every write goes through one queue and ends as one commit.
@@ -611,8 +621,8 @@ export class MemoryService {
 		if (hash !== now) throw new MemoryError("CONFLICT", `«${path}» changed since you read it.`, { path, hash: now, content: current });
 	}
 
-	private commitMessage(client: ClientIdentity, tool: string, reason: string): string {
-		const trailers = [`Client: ${client.id}`, `Tool: ${tool}`];
+	private commitMessage(client: ClientIdentity, tool: string, reason: string, extra: string[] = []): string {
+		const trailers = [`Client: ${client.id}`, `Tool: ${tool}`, ...extra];
 		if (client.session) trailers.push(`Session: ${client.session.replace(/\s+/g, " ").slice(0, 200)}`);
 		return `${reason}\n\n${trailers.join("\n")}\n`;
 	}
@@ -630,7 +640,7 @@ export class MemoryService {
 		client: ClientIdentity,
 		tool: string,
 		rawReason: unknown,
-		apply: () => Promise<{ paths: string[]; result: { path: string; [k: string]: unknown }; warnings?: Warning[]; contentPath?: string }>,
+		apply: () => Promise<{ paths: string[]; result: { path: string; [k: string]: unknown }; warnings?: Warning[]; contentPath?: string; trailers?: string[] }>,
 	): Promise<WriteResult> {
 		if (client.scope !== "write") return Promise.reject(READ_ONLY);
 		let reason: string;
@@ -653,7 +663,7 @@ export class MemoryService {
 					const hash = (await this.exists(contentPath)) ? blobHash(await this.readText(contentPath)) : null;
 					return { commit: before, hash, ...applied.result, warnings: [...(applied.warnings ?? []), { code: "NO_CHANGES" as const, message: "Nothing changed; no commit was made." }] };
 				}
-				await this.git.run(["commit", "-q", "--no-verify", "-F", "-"], { input: this.commitMessage(client, tool, reason), env: this.authorEnv(client) });
+				await this.git.run(["commit", "-q", "--no-verify", "-F", "-"], { input: this.commitMessage(client, tool, reason, applied.trailers), env: this.authorEnv(client) });
 			} catch (error) {
 				await this.restoreWorktree(before).catch((e) => this.log("error", "worktree.restore_failed", { error: String(e) }));
 				throw error;
@@ -720,7 +730,7 @@ export class MemoryService {
 	/** What the server sends as MCP `instructions`: the repo's rules file plus the short index. */
 	async instructions(): Promise<string> {
 		const parts = [
-			"This server is a shared, git-versioned memory of Markdown notes. Every write is a commit attributed to you; give a one-line `reason` in the user's language. Search before creating notes; read a note before rewriting it and pass back its `hash`. Link notes with [[name]]. To say how two notes relate, write the link as a field, `key:: [[name]]` on its own line or `[key:: [[name]]]` inside a sentence; `links` can then filter by that key.",
+			"This server is a shared, git-versioned memory of Markdown notes. Every write is a commit attributed to you; give a one-line `reason` in the user's language. Search before creating notes; read a note before rewriting it and pass back its `hash`. Link notes with [[name]]. To say how two notes relate, write the link as a field, `key:: [[name]]` on its own line or `[key:: [[name]]]` inside a sentence; `links` can then filter by that key. `recent` shows what changed lately; to undo a change, find its commit there and `revert` it.",
 		];
 		const allowed = this.conventions.relations.allowed;
 		const inUse = this.index.relations().map((r) => r.relation);
@@ -869,15 +879,87 @@ export class MemoryService {
 			.filter((b) => b.trim())
 			.map((b) => {
 				const [commit, date, author, email, message, trailerText] = b.split("\x1f") as string[];
-				const trailers: Record<string, string> = {};
-				for (const line of (trailerText ?? "").split("\n")) {
-					const m = /^([\w-]+):\s*(.*)$/.exec(line.trim());
-					if (m) trailers[m[1] as string] = m[2] as string;
-				}
-				return { commit, date, author, email, message, trailers };
+				return { commit, date, author, email, message, trailers: parseTrailers(trailerText) };
 			});
 		if (commits.length === 0) throw new MemoryError("NOT_FOUND", `No history for «${path}».`);
 		return { path, commits };
+	}
+
+	/** A commit given by a client: full or abbreviated hash, in the history of HEAD. Returns the full hash. */
+	private async resolveCommit(raw: unknown, field = "commit"): Promise<string> {
+		const rev = typeof raw === "string" ? raw.trim() : "";
+		if (!/^[0-9a-f]{4,64}$/i.test(rev)) throw new MemoryError("INVALID_REVISION", `«${field}» must be a commit hash, e.g. one from \`history\` or \`recent\`.`);
+		const r = await this.git.run(["rev-parse", "--verify", "-q", `${rev}^{commit}`], { allowFail: true });
+		const full = r.stdout.trim();
+		if (r.code !== 0 || !full) throw new MemoryError("INVALID_REVISION", `Unknown commit «${rev}».`);
+		const head = await this.git.head();
+		const inHistory = head ? (await this.git.run(["merge-base", "--is-ancestor", full, head], { allowFail: true })).code === 0 : false;
+		if (!inHistory) throw new MemoryError("INVALID_REVISION", `Commit «${rev}» is not in this memory's history.`);
+		return full;
+	}
+
+	/**
+	 * Commits across the whole memory, newest first, with the files each one changed.
+	 * `since` (a date) or `after` (a commit: only what came after it) narrow it; `folder` keeps only commits that touched it.
+	 */
+	async recent(args: { since?: string; after?: string; folder?: string; limit?: number; cursor?: string }) {
+		const limit = Math.min(Math.max(args.limit ?? 20, 1), 100);
+		const offset = args.cursor ? Number(args.cursor) : 0;
+		if (!Number.isInteger(offset) || offset < 0) throw new MemoryError("INVALID_ARGUMENT", "Invalid «cursor»: pass the next_cursor of the previous page.");
+		const head = await this.git.head();
+		if (!head) return { commits: [], next_cursor: null };
+		const range = args.after ? `${await this.resolveCommit(args.after, "after")}..${head}` : head;
+		let since: number | null = null;
+		if (args.since) {
+			const when = Date.parse(args.since);
+			if (Number.isNaN(when)) throw new MemoryError("INVALID_ARGUMENT", "«since» must be a date, e.g. «2026-10-01» or «2026-10-01T09:00:00+02:00».");
+			since = Math.floor(when / 1000);
+		}
+		const pathspec: string[] = [];
+		if (args.folder) {
+			const folder = args.folder.trim().replace(/\/+$/, "");
+			if (!/^[^/\\\0]+$/.test(folder) || folder.startsWith(".") || folder.startsWith("-")) throw new MemoryError("INVALID_ARGUMENT", "«folder» must be a top-level folder, e.g. «personas».");
+			pathspec.push("--", `:(literal)${folder}/`);
+		}
+		// Select the commits first (date filter done here: git's --since stops early and misreads far-off dates), then describe the page.
+		const selected = (await this.git.out(["rev-list", "--timestamp", range, ...pathspec]))
+			.split("\n")
+			.filter(Boolean)
+			.map((l) => l.split(" ") as [string, string])
+			.filter(([ts]) => since === null || Number(ts) >= since)
+			.map(([, hash]) => hash);
+		const page = selected.slice(offset, offset + limit);
+		if (page.length === 0) return { commits: [], next_cursor: null };
+		const out = await this.git.out(["log", "--no-walk=unsorted", "-M", "--name-status", "--format=%x1e%H%x1f%aI%x1f%an%x1f%s%x1f%(trailers:only=true,unfold=true)%x1d", ...page]);
+		const MAX_FILES = 50;
+		const STATUS: Record<string, string> = { A: "added", M: "modified", D: "deleted", R: "renamed", C: "copied", T: "modified" };
+		const commits = out
+			.split("\x1e")
+			.filter((b) => b.trim())
+			.map((block) => {
+				const end = block.indexOf("\x1d");
+				const [commit, date, author, message, trailerText] = block.slice(0, end).split("\x1f") as string[];
+				const files = block
+					.slice(end + 1)
+					.split("\n")
+					.filter((l) => l.includes("\t"))
+					.map((l) => {
+						const [code, a, b] = l.split("\t") as [string, string, string | undefined];
+						const status = STATUS[code[0] as string] ?? "modified";
+						return b !== undefined ? { status, path: b, from: a } : { status, path: a };
+					});
+				return {
+					commit,
+					date,
+					author,
+					message,
+					trailers: parseTrailers(trailerText),
+					files: files.slice(0, MAX_FILES),
+					...(files.length > MAX_FILES ? { files_more: files.length - MAX_FILES } : {}),
+				};
+			});
+		const more = selected.length > offset + limit;
+		return { commits, next_cursor: more ? String(offset + limit) : null };
 	}
 
 	// ── write tools ──────────────────────────────────────────────────────────
@@ -1030,6 +1112,93 @@ export class MemoryService {
 				paths.push(binary);
 			}
 			return { paths, result: { path: row.path } };
+		});
+	}
+
+	/**
+	 * Undoes one earlier commit with a new commit (`git revert`), so nothing is lost from history.
+	 * Refuses merges and the first commit; reports a conflict when later commits changed the same lines,
+	 * and keeps the invariants of the other tools: unique names, and no note removed while others still link to it.
+	 */
+	revert(client: ClientIdentity, args: { commit: string; reason: string }): Promise<WriteResult> {
+		return this.mutate(client, "revert", args.reason, async () => {
+			const target = await this.resolveCommit(args.commit);
+			const parents = (await this.git.out(["rev-list", "--parents", "-n1", target])).trim().split(" ").slice(1);
+			if (parents.length === 0) throw new MemoryError("INVALID_ARGUMENT", "The first commit of the memory cannot be reverted.");
+			if (parents.length > 1) throw new MemoryError("INVALID_ARGUMENT", "Merge commits cannot be reverted; revert the commits it brought in instead.");
+			const subject = (await this.git.out(["log", "-1", "--format=%s", target])).trim();
+			const touched = (await this.git.out(["diff-tree", "--no-commit-id", "--no-renames", "--name-only", "-r", "-z", target])).split("\0").filter(Boolean);
+			if (touched.length === 0) throw new MemoryError("INVALID_ARGUMENT", "That commit changed no files; there is nothing to revert.");
+
+			const reverted = await this.git.run(["revert", "--no-commit", "--no-edit", target], { allowFail: true });
+			if (reverted.code !== 0) {
+				const conflicted = (await this.git.out(["diff", "--name-only", "--diff-filter=U", "-z"])).split("\0").filter(Boolean);
+				await this.git.run(["revert", "--abort"], { allowFail: true });
+				if (conflicted.length === 0) throw new Error(`git revert failed: ${reverted.stderr.trim()}`);
+				const later = (await this.git.out(["log", "--format=%H%x1f%an%x1f%s", `${target}..HEAD`, "--", ...conflicted]))
+					.split("\n")
+					.filter(Boolean)
+					.map((l) => {
+						const [commit, author, message] = l.split("\x1f") as string[];
+						return { commit, author, message };
+					});
+				throw new MemoryError("REVERT_CONFLICT", "Later commits changed the same lines, so this commit cannot be undone on its own. Revert those first (newest first), or edit the note by hand.", {
+					paths: conflicted,
+					later_commits: later,
+				});
+			}
+			// Leave the result unstaged: the write path stages exactly the paths it is given.
+			await this.git.run(["reset", "-q"]);
+			const status = (await this.git.out(["status", "--porcelain", "-z", "--untracked-files=all"])).split("\0").filter(Boolean);
+			const changed = status.map((entry) => ({ code: entry.slice(0, 2), path: entry.slice(3) }));
+			const deleted = changed.filter((c) => c.code.includes("D")).map((c) => c.path);
+			const present = changed.filter((c) => !c.code.includes("D")).map((c) => c.path);
+			const added = changed.filter((c) => c.code === "??").map((c) => c.path);
+
+			for (const path of present) await this.assertNoSymlink(path);
+
+			// Names stay unique: a restored note may not take a name another note has since.
+			const leaving = new Set(deleted);
+			for (const path of added.filter((p) => p.toLowerCase().endsWith(".md") && !this.isRootFile(p))) {
+				const taken = this.index.notesByName(noteName(path)).filter((n) => n.path !== path && !leaving.has(n.path));
+				if (taken.length) throw new MemoryError("NAME_TAKEN", `Reverting would bring back «${path}», but «${taken[0]?.path}» now has the same name. Rename one of them first.`, { path, existing: taken.map((t) => t.path) });
+			}
+
+			// No note or file disappears while notes that stay still link to it.
+			const remainingNames = new Set([...present].map((p) => (p.toLowerCase().endsWith(".md") ? noteName(p) : (p.split("/").pop() ?? p)).toLowerCase()));
+			const gone = deleted.filter((p) => !remainingNames.has((p.toLowerCase().endsWith(".md") ? noteName(p) : (p.split("/").pop() ?? p)).toLowerCase()));
+			const goneNames = new Map(gone.map((p) => [(p.toLowerCase().endsWith(".md") ? noteName(p) : (p.split("/").pop() ?? p)).toLowerCase(), p]));
+			const backlinks: { src_path: string; target: string; line: number }[] = [];
+			for (const path of gone) {
+				for (const l of this.index.linksIn(path)) {
+					if (leaving.has(l.srcPath) || present.includes(l.srcPath)) continue; // judged on its new content below
+					backlinks.push({ src_path: l.srcPath, target: path, line: l.line });
+				}
+			}
+			const warnings: Warning[] = [];
+			for (const path of present.filter((p) => p.toLowerCase().endsWith(".md"))) {
+				const content = await this.readText(path);
+				for (const link of parseTypedLinks(content)) {
+					const target = goneNames.get(link.targetName);
+					if (target && target !== path) backlinks.push({ src_path: path, target, line: link.line });
+				}
+				if (!this.isRootFile(path)) {
+					const problems = parseNote(content, this.conventions).problems;
+					if (problems.length) warnings.push({ code: "FRONTMATTER_PROBLEMS", message: `«${path}» comes back with an invalid frontmatter: ${problems.join("; ")}. Fix it when you can.`, path, problems });
+				}
+			}
+			if (backlinks.length) {
+				throw new MemoryError("HAS_BACKLINKS", "Reverting would remove notes that others still link to; fix or remove those links first (or revert the commits that added them).", { backlinks });
+			}
+
+			const paths = changed.map((c) => c.path);
+			const main = present.find((p) => p.toLowerCase().endsWith(".md")) ?? paths[0] ?? touched.find((p) => p.toLowerCase().endsWith(".md")) ?? (touched[0] as string);
+			return {
+				paths,
+				result: { path: main, paths, reverted: { commit: target, message: subject } },
+				warnings,
+				trailers: [`Reverts: ${target}`],
+			};
 		});
 	}
 
