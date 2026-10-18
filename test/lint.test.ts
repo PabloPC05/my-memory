@@ -1,5 +1,7 @@
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { main } from "../src/cli.js";
 import { defaultConventions, parseConventions } from "../src/conventions.js";
 import { parseNote } from "../src/frontmatter.js";
 import { type LintItem, lint } from "../src/lint.js";
@@ -187,6 +189,30 @@ mention_min_length = 5
 		} finally {
 			index.close();
 		}
+	});
+});
+
+describe("my-memory lint", () => {
+	it("reads the running server's index read-only and validates --limit", async () => {
+		env = await makeMemory(SEED);
+		const file = join(env.root, "config.toml");
+		await writeFile(file, `data_dir = "${join(env.root, "data").replace(/\\/g, "/")}"\n[listen.private]\nport = 8782\n`);
+		const out: string[] = [];
+		const stdout = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => (out.push(String(chunk)), true));
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => (out.push(String(chunk)), true));
+		try {
+			expect(await main(["lint", "--config", file, "--json", "--limit", "2"])).toBe(0);
+			expect(JSON.parse(out.join("")).items).toHaveLength(2);
+			for (const bad of ["0", "-3", "abc", "2x"]) {
+				out.length = 0;
+				expect(await main(["lint", "--config", file, `--limit=${bad}`])).toBe(1);
+				expect(out.join("")).toContain("--limit must be a positive whole number");
+			}
+		} finally {
+			stdout.mockRestore();
+			stderr.mockRestore();
+		}
+		expect(env.memory.search({ query: "hipoteca" }).hits.length).toBeGreaterThan(0); // the server's index is intact
 	});
 });
 

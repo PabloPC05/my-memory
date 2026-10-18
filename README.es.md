@@ -182,12 +182,12 @@ Subidas para `attach`: `curl -T file.pdf -H "Authorization: Bearer $TOKEN" http:
     remote = { url = "http://127.0.0.1:3000/me/notes.git"; tokenFile = "/run/secrets/forgejo-token"; };
     listen.private = { address = "127.0.0.1"; port = 8782; };
     tokensFile = "/var/lib/secrets/my-memory/tokens.toml";   # root:my-memory 0640
-    # ocr = { enable = true; languages = [ "spa" "eng" ]; maxPages = 50; pageTimeoutSeconds = 120; };
+    # ocr = { enable = true; languages = [ "spa" "eng" ]; maxPages = 50; pageTimeoutSeconds = 120; dpi = 300; };
   };
 }
 ```
 
-Tras `my-memory token add … --file <tokensFile>`, ejecuta `systemctl reload my-memory`. El paquete trae pdftotext, pdftoppm y tesseract; el módulo instala los datos de los idiomas de `ocr.languages` (por defecto español e inglés).
+Tras `my-memory token add … --file <tokensFile>`, ejecuta `systemctl reload my-memory`. El paquete trae pdftotext, pdftoppm y tesseract; el módulo instala los datos de los idiomas de `ocr.languages` (por defecto español e inglés), y solo compila ese tesseract con `ocr.enable` activado.
 
 Para la búsqueda por significado, añade `embeddings = { url = "http://127.0.0.1:11434/v1/embeddings"; model = "nomic-embed-text"; queryPrefix = "search_query: "; documentPrefix = "search_document: "; };` (con `apiKeyFile` si el endpoint pide clave), por ejemplo junto a `services.ollama`.
 

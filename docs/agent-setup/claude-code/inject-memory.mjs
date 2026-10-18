@@ -12,7 +12,8 @@
 //   }
 //
 // Environment (in the hook's environment, e.g. settings.json "env"):
-//   MY_MEMORY_URL               MCP endpoint, e.g. https://memory.example.org/mcp (required)
+//   MY_MEMORY_URL               MCP endpoint, e.g. https://memory.example.org/mcp (required; plain http only to
+//                               localhost, 127.0.0.1 or ::1, so the token never crosses the network in clear)
 //   MY_MEMORY_TOKEN             bearer token; use a read-only one (required by my-memory; optional for other gateways)
 //   MEMORY_SEARCH_TOOL          tool name, default "search" (behind a gateway e.g. "memoria_search")
 //   MEMORY_LIST_TOOL            tool name for SessionStart, default "list"
@@ -27,6 +28,8 @@
 
 const PROTOCOL_VERSION = "2025-06-18";
 
+const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
 const int = (value, fallback) => {
   const n = Number.parseInt(String(value ?? ""), 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
@@ -36,7 +39,7 @@ export function configFrom(env) {
   let url = null;
   try {
     const u = new URL(String(env.MY_MEMORY_URL ?? ""));
-    if (u.protocol === "https:" || u.protocol === "http:") url = u.href;
+    if (u.protocol === "https:" || (u.protocol === "http:" && LOOPBACK.has(u.hostname))) url = u.href;
   } catch {}
   const searchTool = env.MEMORY_SEARCH_TOOL || "search";
   return {
@@ -270,7 +273,7 @@ export async function callTool(cfg, name, args, signal) {
       // Best effort: end the session so the gateway does not keep it around.
       const headers = { "mcp-session-id": session.id, "mcp-protocol-version": session.version };
       if (cfg.token) headers.authorization = `Bearer ${cfg.token}`;
-      await fetch(cfg.url, { method: "DELETE", headers, signal: AbortSignal.any([signal, AbortSignal.timeout(300)]) }).catch(() => {});
+      await fetch(cfg.url, { method: "DELETE", headers, signal: AbortSignal.any([signal, AbortSignal.timeout(300)]), redirect: "error" }).catch(() => {});
     }
   }
 }

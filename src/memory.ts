@@ -542,7 +542,7 @@ export class MemoryService {
 		return readFile(this.abs(path), "utf8");
 	}
 
-	private async writeText(path: string, content: string): Promise<void> {
+	private async writeText(path: string, content: string | Buffer): Promise<void> {
 		const abs = this.abs(path);
 		await mkdir(dirname(abs), { recursive: true });
 		const tmp = `${abs}.${randomBytes(6).toString("hex")}.tmp`;
@@ -818,9 +818,14 @@ export class MemoryService {
 		return { folder: args.folder ? args.folder.replace(/\/+$/, "") : null, includeArchive: args.include_archive ?? false, limit: Math.min(Math.max(args.limit ?? 10, 1), 50) };
 	}
 
-	private textHits(args: SearchArgs, limit?: number): { mode: "all" | "any"; hits: SearchHit[] } {
+	private ftsQuery(args: SearchArgs) {
 		const q = buildFtsQuery(args.query ?? "");
 		if (!q) throw new MemoryError("INVALID_ARGUMENT", "The query has no words to search for.");
+		return q;
+	}
+
+	private textHits(args: SearchArgs, limit?: number): { mode: "all" | "any"; hits: SearchHit[] } {
+		const q = this.ftsQuery(args);
 		const opts = { ...this.searchOpts(args), ...(limit ? { limit } : {}) };
 		let mode: "all" | "any" = "all";
 		let hits = this.index.search(q.and, opts);
@@ -853,9 +858,10 @@ export class MemoryService {
 		if (want === "text") return this.search(args);
 		const opts = this.searchOpts(args);
 		const pool = Math.max(opts.limit * 3, 30);
-		const text = this.textHits(args, pool);
+		this.ftsQuery(args); // the same error as a text search, before calling the endpoint
 		const vector = await (this.embedder as Embedder).embedQuery(args.query);
 		if (!vector) return this.search(args);
+		// Everything below reads the index synchronously, after the await: a reindex cannot renumber the sections in between.
 		const ranked = this.index
 			.sectionVectors(opts)
 			.filter((s) => s.vector.length === vector.length)
@@ -866,6 +872,7 @@ export class MemoryService {
 		if (want === "semantic") {
 			return { mode: "semantic" as const, hits: MemoryService.hitsOut(ranked.slice(0, opts.limit).map((r) => this.index.sectionHit(r.id, round(r.similarity)))) };
 		}
+		const text = this.textHits(args, pool);
 		const byId = new Map(text.hits.map((h) => [h.sectionId, h]));
 		const fused = [...reciprocalRankFusion([text.hits.map((h) => h.sectionId), ranked.map((r) => r.id)])].sort((a, b) => b[1] - a[1]).slice(0, opts.limit);
 		const hits = fused.map(([id, score]) => {
@@ -1221,6 +1228,11 @@ export class MemoryService {
 		return this.git.out(["cat-file", "blob", id]);
 	}
 
+	/** A blob as raw bytes, for files copied from history unchanged (no round trip through UTF-8). */
+	private async blobBytes(id: string): Promise<Buffer> {
+		return this.git.bytes(["cat-file", "blob", id]);
+	}
+
 	/** Three-way merge of text (`git merge-file`): the result, or null when the changes overlap. */
 	private async mergeText(ours: string, base: string, theirs: string): Promise<string | null> {
 		const dir = await mkdtemp(join(tmpdir(), "mm-merge-"));
@@ -1275,15 +1287,27 @@ export class MemoryService {
 						later_commits: later.map((l) => ({ commit: l.slice(0, 40), message: l.slice(41) })),
 					});
 				};
+				let renamedLater: FileChange[] | null = null;
+				/** Whether a path was moved (renamed) by a later commit, as opposed to deleted. */
+				const movedSince = async (p: string) => {
+					renamedLater ??= parseNameStatus(await this.git.out(["log", "-M", "--diff-filter=R", "--name-status", "--format=", `${target}..HEAD`]));
+					return renamedLater.some((r) => r.from === p);
+				};
+				const writes = new Map<string, string>(); // text, for the checks below
+				const raw = new Map<string, Buffer>(); // exact bytes to write instead, for files copied from history unchanged
 				/** Old text back on top of the current one, keeping later changes that do not overlap. */
-				const restoreText = async (p: string, now: string, was: string, old: string) => {
-					if (now === was) return this.blobText(old);
+				const restoreText = async (dest: string, p: string, now: string, was: string, old: string) => {
+					if (now === was) {
+						const bytes = await this.blobBytes(old);
+						raw.set(dest, bytes);
+						writes.set(dest, bytes.toString("utf8"));
+						return;
+					}
 					const merged = await this.mergeText(await this.blobText(now), await this.blobText(was), await this.blobText(old));
 					if (merged === null) throw await conflict(p, "was changed again where this commit changed it");
-					return merged;
+					writes.set(dest, merged);
 				};
 
-				const writes = new Map<string, string>();
 				const removes = new Set<string>();
 				const renames: { from: string; to: string }[] = [];
 				const created = new Set<string>(); // paths that do not exist now and the revert brings back
@@ -1292,7 +1316,10 @@ export class MemoryService {
 					const now = await this.blobAt("HEAD", c.path);
 					const was = await this.blobAt(target, c.path);
 					if (c.status === "A" || c.status === "C") {
-						if (now === null) continue; // already gone
+						if (now === null) {
+							if (await movedSince(c.path)) throw await conflict(c.path, "was moved");
+							continue; // already gone
+						}
 						if (now !== was) throw await conflict(c.path, "was changed");
 						removes.add(c.path);
 						summary.push({ path: c.path, change: "removed" });
@@ -1301,7 +1328,7 @@ export class MemoryService {
 						if (now === old) continue; // already back
 						if (now !== null) throw await conflict(c.path, "was created again");
 						if (!isText(c.path)) throw notRestorable(c.path);
-						writes.set(c.path, await this.blobText(old));
+						await restoreText(c.path, c.path, old, old, old);
 						created.add(c.path);
 						summary.push({ path: c.path, change: "restored" });
 					} else if (c.status === "R" && c.from) {
@@ -1310,7 +1337,7 @@ export class MemoryService {
 						if (now === null && nowOld === old) continue; // already moved back
 						if (now === null) throw await conflict(c.path, "was moved or deleted");
 						if (nowOld !== null) throw await conflict(c.from, "was created again");
-						if (isText(c.path) && isText(c.from)) writes.set(c.from, await restoreText(c.path, now, was as string, old));
+						if (isText(c.path) && isText(c.from)) await restoreText(c.from, c.path, now, was as string, old);
 						else if (now === was && was === old) renames.push({ from: c.path, to: c.from });
 						else throw notRestorable(c.path);
 						removes.add(c.path);
@@ -1321,16 +1348,17 @@ export class MemoryService {
 						if (now === old) continue; // already as it was
 						if (now === null || old === null) throw await conflict(c.path, "was deleted");
 						if (!isText(c.path)) throw notRestorable(c.path);
-						writes.set(c.path, await restoreText(c.path, now, was as string, old));
+						await restoreText(c.path, c.path, now, was as string, old);
 						summary.push({ path: c.path, change: "reverted" });
 					}
 				}
 
-				// The same rules as the other writes: allowed paths, unique names, valid frontmatter, no broken backlinks.
+				// The same rules as the other writes: allowed paths (no hidden files, allowed folders), unique names,
+				// valid frontmatter, no broken backlinks.
 				const touched = [...writes.keys(), ...removes, ...renames.map((r) => r.to)];
+				for (const p of new Set([...touched, ...renames.map((r) => r.from)])) checkPath(p, this.conventions, /\.md$/i.test(p) ? "note" : "asset");
 				for (const p of touched) await this.assertNoSymlink(p);
 				for (const p of created) {
-					if (p.includes("/") || /\.md$/i.test(p)) checkPath(p, this.conventions, /\.md$/i.test(p) ? "note" : "asset");
 					const key = targetNameOf(p);
 					const taken = (/\.md$/i.test(p) ? this.index.notesByName(key).map((n) => n.path) : this.index.assetsByName(key)).filter((t) => t !== p && !removes.has(t));
 					if (taken.length) throw new MemoryError("NAME_TAKEN", `A note or file named «${key}» exists now at ${taken[0]}; names must be unique across folders.`, { path: p, existing: taken });
@@ -1370,7 +1398,7 @@ export class MemoryService {
 					await mkdir(dirname(this.abs(r.to)), { recursive: true });
 					await rename(this.abs(r.from), this.abs(r.to));
 				}
-				for (const [p, text] of writes) await this.writeText(p, text);
+				for (const [p, text] of writes) await this.writeText(p, raw.get(p) ?? text);
 				const paths = [...new Set([...touched, ...renames.map((r) => r.from)])];
 				const main = only ? (summary[0]?.path ?? only) : (summary.find((s) => /\.md$/i.test(s.path) && s.change !== "removed")?.path ?? summary[0]?.path ?? changes[0]?.path ?? "");
 				return { paths, result: { path: main, reverted: target, changes: summary }, warnings, contentPath: main, trailers: { Reverts: target } };

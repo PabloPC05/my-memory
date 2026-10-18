@@ -75,6 +75,18 @@ export class Git {
 		return (await this.run(args)).stdout;
 	}
 
+	/** Stdout as raw bytes (blobs), failing like `run` does. */
+	bytes(args: string[]): Promise<Buffer> {
+		return new Promise((resolve, reject) => {
+			execFile(this.options.gitBinary ?? "git", args, { cwd: this.cwd, env: this.env(), maxBuffer: 256 * 1024 * 1024, encoding: "buffer", windowsHide: true }, (error, stdout, stderr) => {
+				if (!error) return resolve(stdout);
+				const errCode = (error as { code?: unknown }).code;
+				if (errCode === "ENOENT") return reject(new Error(`git binary not found (${this.options.gitBinary ?? "git"})`));
+				reject(new GitError(args, { stdout: "", stderr: stderr.toString("utf8"), code: typeof errCode === "number" ? errCode : 1 }));
+			});
+		});
+	}
+
 	async head(): Promise<string | null> {
 		const r = await this.run(["rev-parse", "--verify", "-q", "HEAD"], { allowFail: true });
 		return r.code === 0 ? r.stdout.trim() : null;

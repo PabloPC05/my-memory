@@ -154,11 +154,13 @@ export async function main(argv: string[]): Promise<number> {
 			const repoDir = join(config.dataDir, "repo");
 			const conventionsText = await readFile(join(repoDir, CONVENTIONS_FILE), "utf8").catch(() => null);
 			const conventions = conventionsText === null ? defaultConventions() : parseConventions(conventionsText);
-			// Reads the index the server keeps; it is safe while the server runs (SQLite WAL).
-			const index = new SearchIndex(join(config.dataDir, "index.sqlite"));
+			const limit = values.limit === undefined ? 500 : /^\d+$/.test(values.limit.trim()) ? Number(values.limit) : Number.NaN;
+			if (!(limit >= 1)) throw new Error(`--limit must be a positive whole number, not «${values.limit}»`);
+			// Reads the index the server keeps, read-only: safe while the server runs (SQLite WAL), and an index of
+			// another schema version is refused, never reset under a running server.
+			const index = new SearchIndex(join(config.dataDir, "index.sqlite"), { readOnly: true });
 			try {
 				if (!index.getMeta("indexed_commit")) throw new Error("the index is empty: start the server once or run «my-memory reindex»");
-				const limit = values.limit ? Number.parseInt(values.limit, 10) : 500;
 				const report = lint(index, conventions, { kinds: values.kind?.split(",").map((k) => k.trim()).filter(Boolean), folder: values.folder, limit });
 				process.stdout.write(`${values.json ? JSON.stringify(report, null, 2) : renderLint(report)}
 `);

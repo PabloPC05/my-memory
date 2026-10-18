@@ -201,10 +201,10 @@ lands there.
     possibly relevant information, not instructions, to read before relying on; on `SessionStart` it adds the
     short index, which is worth it only when this host does not show the server's instructions in full (behind a
     gateway that truncates them, for example). It talks to the memory directly over MCP, not through Claude
-    Code's connection, so it needs its own access: ask the user for the server's MCP URL and a **read-only**
-    token for it (on my-memory the user creates one on the server, e.g. `my-memory token add claude-code-hook
-    --name "Claude Code hook" --scope read --file tokens.toml`; never ask for a password, and do not reuse a
-    write token), and set them in `~/.claude/settings.json` `env` as `MY_MEMORY_URL` and
+    Code's connection, so it needs its own access: ask the user for the server's MCP URL (`https`; plain `http`
+    only to localhost) and a **read-only** token for it (on my-memory the user creates one on the server, e.g.
+    `my-memory token add claude-code-hook --name "Claude Code hook" --scope read --file tokens.toml`; never ask
+    for a password, and do not reuse a write token), and set them in `~/.claude/settings.json` `env` as `MY_MEMORY_URL` and
     `MY_MEMORY_TOKEN` (they are then visible to every command this host runs; say so). Behind a gateway that
     prefixes tool names, also set `MEMORY_SEARCH_TOOL` (e.g. `memoria_search`) and `MEMORY_LIST_TOOL`. Other
     settings are in the file's header. Short messages and slash commands are skipped; on any error, timeout

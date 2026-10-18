@@ -126,6 +126,21 @@ describe("embeddings", () => {
 		expect(await env.memory.searchAny({ query: "hipoteca", mode: "text" })).toEqual(env.memory.search({ query: "hipoteca" }));
 		// Filters apply to the vectors too.
 		expect((await env.memory.searchAny({ query: "automóvil", folder: "yo" })).hits).toEqual([]);
+		// The text hits are read after the query is embedded (a reindex in between could renumber the sections),
+		// and not at all in semantic mode.
+		const order: string[] = [];
+		const index = env.memory.index;
+		const search = index.search.bind(index);
+		const embedQuery = embedder.embedQuery.bind(embedder);
+		index.search = (...a: Parameters<typeof search>) => (order.push("text"), search(...a));
+		embedder.embedQuery = async (q: string) => (order.push("embed"), embedQuery(q));
+		await env.memory.searchAny({ query: "automóvil" });
+		expect(order).toEqual(["embed", "text"]);
+		order.length = 0;
+		await env.memory.searchAny({ query: "automóvil", mode: "semantic" });
+		expect(order).toEqual(["embed"]);
+		index.search = search;
+		embedder.embedQuery = embedQuery;
 
 		expect(lines.some((l) => l.includes('"embeddings.status"'))).toBe(true);
 		expect(lines.join("\n")).not.toMatch(/autom|veh[ií]culo|sk-test/i);
@@ -212,6 +227,24 @@ describe("embeddings", () => {
 		expect(index.getMeta("indexed_commit")).toBeNull();
 		expect(index.pendingEmbeddingCount()).toBe(0);
 		index.close();
+	});
+
+	it("opens an index read-only for the CLI, refusing another schema version instead of resetting it", async () => {
+		const dir = await tempDir();
+		const path = join(dir, "index.sqlite");
+		expect(() => new SearchIndex(join(dir, "missing.sqlite"), { readOnly: true })).toThrow(/cannot open the index/);
+		const old = new DatabaseSync(path);
+		old.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO meta VALUES ('schema_version', '2'), ('indexed_commit', 'abc');");
+		old.close();
+		expect(() => new SearchIndex(path, { readOnly: true })).toThrow(/schema version 2 and this my-memory expects/);
+		const check = new DatabaseSync(path);
+		expect(check.prepare("SELECT value FROM meta WHERE key = 'indexed_commit'").get()).toEqual({ value: "abc" }); // untouched
+		check.close();
+		new SearchIndex(path).close(); // the server's open rebuilds it
+		const ro = new SearchIndex(path, { readOnly: true });
+		expect(ro.getMeta("schema_version")).toBe(SCHEMA_VERSION);
+		expect(() => ro.setMeta("x", "y")).toThrow(/readonly/i);
+		ro.close();
 	});
 
 	it("reads [embeddings] from the config, with the key from a file", async () => {

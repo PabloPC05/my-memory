@@ -18,7 +18,7 @@ let
   cfg = config.services.my-memory;
   toml = pkgs.formats.toml { };
 
-  # Tesseract with just the language data the OCR config asks for.
+  # Tesseract with just the language data the OCR config asks for. Only referenced (so only built) with OCR on.
   ocrTesseract = pkgs.tesseract.override { enableLanguages = lib.unique cfg.ocr.languages; };
 
   listenType = types.submodule {
@@ -49,14 +49,18 @@ let
       fetch_interval_seconds = cfg.fetchIntervalSeconds;
       log_level = cfg.logLevel;
       pdftotext = "${pkgs.poppler-utils}/bin/pdftotext";
-      ocr = {
-        enabled = cfg.ocr.enable;
-        languages = lib.concatStringsSep "+" cfg.ocr.languages;
-        max_pages = cfg.ocr.maxPages;
-        page_timeout_seconds = cfg.ocr.pageTimeoutSeconds;
-        tesseract = "${ocrTesseract}/bin/tesseract";
-        pdftoppm = "${pkgs.poppler-utils}/bin/pdftoppm";
-      };
+      ocr =
+        {
+          enabled = cfg.ocr.enable;
+        }
+        // optionalAttrs cfg.ocr.enable {
+          languages = lib.concatStringsSep "+" cfg.ocr.languages;
+          max_pages = cfg.ocr.maxPages;
+          page_timeout_seconds = cfg.ocr.pageTimeoutSeconds;
+          inherit (cfg.ocr) dpi;
+          tesseract = "${ocrTesseract}/bin/tesseract";
+          pdftoppm = "${pkgs.poppler-utils}/bin/pdftoppm";
+        };
       listen =
         optionalAttrs (cfg.listen.public != null) { public = cfg.listen.public; }
         // optionalAttrs (cfg.listen.private != null) { private = cfg.listen.private; };
@@ -291,6 +295,11 @@ in
         type = types.ints.positive;
         default = 120;
         description = "Time limit for rendering and recognising one page or image.";
+      };
+      dpi = mkOption {
+        type = types.ints.positive;
+        default = 300;
+        description = "Resolution at which scanned PDF pages are rendered for OCR.";
       };
     };
 

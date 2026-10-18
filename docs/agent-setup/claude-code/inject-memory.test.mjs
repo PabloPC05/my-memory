@@ -26,6 +26,16 @@ for (const [prompt, ok] of queries) check(ok(searchQuery(prompt)), `searchQuery(
 // --- Formatting ---
 const cfg = configFrom({ MY_MEMORY_URL: "http://127.0.0.1:1/mcp", MEMORY_SEARCH_TOOL: "memoria_search" });
 check(cfg.readTool === "memoria_read", "read tool follows the search tool's prefix");
+for (const [url, ok] of [
+  ["https://memory.example.org/mcp", true],
+  ["http://memory.example.org/mcp", false],
+  ["http://192.168.1.10:8080/mcp", false],
+  ["http://localhost:8080/mcp", true],
+  ["http://127.0.0.1:8080/mcp", true],
+  ["http://[::1]:8080/mcp", true],
+  ["ftp://localhost/mcp", false],
+  ["not a url", false],
+]) check((configFrom({ MY_MEMORY_URL: url }).url !== null) === ok, `MY_MEMORY_URL ${url} ${ok ? "accepted" : "refused"}`);
 const hits = Array.from({ length: 10 }, (_, i) => ({ name: `nota-${i}`, section: { heading: `Sección ${i}` }, snippet: `«seguro» del «coche» ${"x".repeat(400)}` }));
 const text = formatHits({ mode: "all", hits }, cfg);
 check(text.length <= cfg.budget, `budget respected (${text.length})`);
@@ -82,7 +92,8 @@ const context = (out) => (out ? JSON.parse(out).hookSpecificOutput.additionalCon
 // Gateway: needs initialize, hands out a session id, answers with SSE, prefixed tool names.
 {
   const s = await serve((req, res, msg) => {
-    if (req.method === "DELETE") return (res.writeHead(200), res.end());
+    // A redirect is never followed, so the token does not go elsewhere: one DELETE only, below.
+    if (req.method === "DELETE") return (res.writeHead(307, { location: "/elsewhere" }), res.end());
     if (msg.method === "initialize") return json(res, answer(msg), { "mcp-session-id": "sess-42" });
     if (req.headers["mcp-session-id"] !== "sess-42") return (res.writeHead(400, { "content-type": "application/json" }), res.end('{"jsonrpc":"2.0","error":{"code":-32000,"message":"Bad Request: No valid session ID provided"},"id":null}'));
     if (!msg.id) return (res.writeHead(202), res.end());

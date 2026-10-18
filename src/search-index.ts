@@ -136,7 +136,32 @@ function toNote(r: Row): NoteRow {
 export class SearchIndex {
 	readonly db: DatabaseSync;
 
-	constructor(path: string) {
+	/**
+	 * `readOnly` is for readers beside the server (`my-memory lint`): it never creates, migrates or resets the
+	 * index, and refuses one made by another schema version instead of dropping the server's tables.
+	 */
+	constructor(path: string, opts: { readOnly?: boolean } = {}) {
+		if (opts.readOnly) {
+			try {
+				this.db = new DatabaseSync(path, { readOnly: true });
+			} catch (error) {
+				throw new Error(`cannot open the index at ${path} (${(error as Error).message}): start the server once or run «my-memory reindex»`);
+			}
+			this.db.exec("PRAGMA busy_timeout = 5000;");
+			let version: string | null = null;
+			try {
+				version = this.getMeta("schema_version");
+			} catch {
+				// No meta table: not an index, or an empty one.
+			}
+			if (version !== SCHEMA_VERSION) {
+				this.db.close();
+				throw new Error(
+					`the index at ${path} has schema version ${version ?? "none"} and this my-memory expects ${SCHEMA_VERSION}; run the same version as the server (the server rebuilds the index when it starts with a new version)`,
+				);
+			}
+			return;
+		}
 		this.db = new DatabaseSync(path);
 		this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;");
 		// The version is checked before the rest of the schema: an older index may lack columns its indexes need.

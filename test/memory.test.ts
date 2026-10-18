@@ -329,6 +329,68 @@ describe("recent and revert", () => {
 		expect(m.index.brokenLinks().filter((l) => l.srcPath !== "AGENTS.md")).toEqual([]);
 	});
 
+	it("refuses to undo a create when the note was moved since, also inside a commit with other files", async () => {
+		env = await makeMemory(SEED);
+		const m = env.memory;
+		const ana = await m.create(writer, { path: "temas/ana.md", content: note("Ana", "Prima"), reason: "Ana" });
+		const mv = await m.move(writer, { from: "temas/ana.md", to: "personas/ana.md", hash: (await m.read({ name: "ana" })).hash, reason: "A personas" });
+		const e = await expectCode(m.revert(writer, { commit: ana.commit as string, reason: "Sin Ana" }), "REVERT_CONFLICT");
+		expect(e.details).toMatchObject({ path: "temas/ana.md", later_commits: [{ commit: mv.commit, message: "A personas" }] });
+		expect(await m.read({ name: "ana" })).toMatchObject({ path: "personas/ana.md" });
+		expect(await repoGit().head()).toBe(mv.commit);
+		// Really deleted since: nothing left to undo.
+		const eva = await m.create(writer, { path: "temas/eva.md", content: note("Eva", "Vecina"), reason: "Eva" });
+		await m.delete(writer, { name: "eva", hash: (await m.read({ name: "eva" })).hash, reason: "Fuera" });
+		expect((await m.revert(writer, { commit: eva.commit as string, reason: "Sin Eva" })).warnings.map((w) => w.code)).toEqual(["NO_CHANGES"]);
+
+		// Two notes created in one commit, one of them moved later: nothing is reverted, not even the other one.
+		const other = await otherClone(env.root, env.bare as string);
+		await other.write("temas/bea.md", note("Bea", "Amiga"));
+		await other.write("temas/carla.md", note("Carla", "Amiga"));
+		await other.commitPush("Bea y Carla");
+		const both = (await other.git.out(["rev-parse", "HEAD"])).trim();
+		m.requestSync("webhook");
+		await new Promise((r) => setTimeout(r, 400));
+		await m.idle();
+		const mv2 = await m.move(writer, { from: "temas/bea.md", to: "personas/bea.md", hash: (await m.read({ name: "bea" })).hash, reason: "Bea a personas" });
+		const e2 = await expectCode(m.revert(writer, { commit: both, reason: "Sin las dos" }), "REVERT_CONFLICT");
+		expect(e2.details.path).toBe("temas/bea.md");
+		expect(await repoGit().head()).toBe(mv2.commit);
+		expect(await repoGit().isClean()).toBe(true);
+		expect(await m.read({ name: "carla" })).toMatchObject({ path: "temas/carla.md" });
+		expect(await m.read({ name: "bea" })).toMatchObject({ path: "personas/bea.md" });
+	});
+
+	it("brings a file back byte for byte, and refuses paths the other writes refuse", async () => {
+		env = await makeMemory(SEED);
+		const m = env.memory;
+		const other = await otherClone(env.root, env.bare as string);
+		// Latin-1 «é» and CRLF: not valid UTF-8, so a round trip through a string would change the bytes.
+		const latin = Buffer.concat([Buffer.from(note("Latin", "Codificación antigua").replace("# Latin", "# Latin\r\nCaf")), Buffer.from([0xe9]), Buffer.from(" con leche\r\n")]);
+		await writeFile(join(other.dir, "temas/latin.md"), latin);
+		await other.write(".gitignore", "*.tmp\n");
+		await other.write("temas/nueva.md", note("Nueva", "Con gitignore"));
+		await other.commitPush("Latin, nueva y gitignore");
+		const added = (await other.git.out(["rev-parse", "HEAD"])).trim();
+		m.requestSync("webhook");
+		await new Promise((r) => setTimeout(r, 400));
+		await m.idle();
+		const file = join(env.root, "data/repo/temas/latin.md");
+		expect(await readFile(file)).toEqual(latin);
+		const ed = await m.edit(writer, { name: "latin", edits: [{ old_string: "con leche", new_string: "solo" }], reason: "Solo" });
+		expect(await readFile(file)).not.toEqual(latin);
+		await m.revert(writer, { commit: ed.commit as string, reason: "Con leche" });
+		expect(await readFile(file)).toEqual(latin);
+
+		// .gitignore is a hidden file: the whole commit cannot be reverted, one note of it can.
+		const e = await expectCode(m.revert(writer, { commit: added, reason: "x" }), "INVALID_PATH");
+		expect(e.details.path).toBe(".gitignore");
+		expect(await repoGit().isClean()).toBe(true);
+		expect(await readFile(join(env.root, "data/repo/.gitignore"), "utf8")).toBe("*.tmp\n");
+		const one = await m.revert(writer, { commit: added, path: "temas/nueva.md", reason: "Sin la nueva" });
+		expect(one.changes).toEqual([{ path: "temas/nueva.md", change: "removed" }]);
+	});
+
 	it("validates the commit and the client", async () => {
 		env = await makeMemory(SEED);
 		const m = env.memory;
