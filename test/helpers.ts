@@ -42,11 +42,11 @@ export async function seedRemote(root: string, files: Record<string, string>): P
 /** A second clone of the remote, to act as "someone else" pushing. */
 export async function otherClone(root: string, bare: string): Promise<{ dir: string; git: Git; write: (path: string, content: string) => Promise<void>; commitPush: (msg: string) => Promise<void> }> {
 	const dir = join(root, `other-${Math.random().toString(36).slice(2, 8)}`);
-	await new Git(root).run(["clone", "-q", bare, dir]);
+	// autocrlf off before the checkout too: with it on (Git for Windows), every file would look changed.
+	await new Git(root).run(["clone", "-q", "-c", "core.autocrlf=false", bare, dir]);
 	const git = new Git(dir);
 	await git.run(["config", "user.name", "Someone"]);
 	await git.run(["config", "user.email", "someone@example.com"]);
-	await git.run(["config", "core.autocrlf", "false"]);
 	return {
 		dir,
 		git,

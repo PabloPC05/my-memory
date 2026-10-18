@@ -2,9 +2,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { MemoryError } from "./errors.js";
+import { LINT_KINDS } from "./lint.js";
 import type { ClientsService } from "./clients.js";
 import type { Logger } from "./log.js";
-import type { ClientIdentity, MemoryService } from "./memory.js";
+import type { ClientIdentity, MemoryService, SearchMode } from "./memory.js";
 import { SETUP_GUIDE_URI, setupGuide } from "./setup-guide.js";
 
 export const SERVER_NAME = "my-memory";
@@ -62,21 +63,25 @@ export async function createMcpServer(memory: MemoryService, client: ClientIdent
 		wrap("list", (a: { folder?: string; include_archive?: boolean; limit?: number; cursor?: string }) => memory.list(a)),
 	);
 
+	// With embeddings configured the tool also searches by meaning; without them it is exactly the full-text search.
+	const semantic = memory.embedder !== null;
 	server.registerTool(
 		"search",
 		{
 			title: "Search notes",
-			description:
-				"Full-text search (accents ignored, word prefixes match). Returns the best sections with a snippet; read the note or the section next. Use quotes for exact phrases. The archive is excluded unless include_archive.",
+			description: semantic
+				? "Hybrid search: full text (accents ignored, word prefixes match) fused with search by meaning, so related words and paraphrases also find notes. Returns the best sections with a snippet; read the note or the section next. Use quotes for exact phrases. The archive is excluded unless include_archive."
+				: "Full-text search (accents ignored, word prefixes match). Returns the best sections with a snippet; read the note or the section next. Use quotes for exact phrases. The archive is excluded unless include_archive.",
 			inputSchema: {
 				query: z.string().describe("Words to look for."),
 				folder: z.string().optional(),
 				include_archive: z.boolean().optional(),
 				limit: z.number().int().min(1).max(50).optional().describe("Default 10."),
+				...(semantic ? { mode: z.enum(["hybrid", "text", "semantic"]).optional().describe("hybrid (default): words and meaning; text: words only; semantic: meaning only.") } : {}),
 			},
 			annotations: read,
 		},
-		wrap("search", (a: { query: string; folder?: string; include_archive?: boolean; limit?: number }) => memory.search(a)),
+		wrap("search", (a: { query: string; folder?: string; include_archive?: boolean; limit?: number; mode?: SearchMode }) => memory.searchAny(a)),
 	);
 
 	server.registerTool(
@@ -121,6 +126,40 @@ export async function createMcpServer(memory: MemoryService, client: ClientIdent
 			annotations: read,
 		},
 		wrap("history", (a: { path?: string; name?: string; limit?: number }) => memory.history(a)),
+	);
+
+	server.registerTool(
+		"recent",
+		{
+			title: "Recent changes",
+			description:
+				"The latest changes to the whole memory, newest first: per commit when, who (author and client), which tool, why (the reason) and the notes it touched (added, modified, deleted, moved). Use it to see what changed lately or to find the commit to `revert`. The archive is left out unless include_archive.",
+			inputSchema: {
+				limit: z.number().int().min(1).max(200).optional().describe("Default 20."),
+				since: z.string().optional().describe("Only changes after this: an ISO date (2026-05-01) or an age like 7d, 12h, 2w."),
+				folder: z.string().optional().describe("Only commits that touched this folder, e.g. «personas»."),
+				client: z.string().optional().describe("Only commits by this client id (Client trailer) or author name."),
+				include_archive: z.boolean().optional(),
+			},
+			annotations: read,
+		},
+		wrap("recent", (a: { limit?: number; since?: string; folder?: string; client?: string; include_archive?: boolean }) => memory.recent(a)),
+	);
+
+	server.registerTool(
+		"lint",
+		{
+			title: "Maintenance worklist",
+			description:
+				"Structural candidates for maintaining the memory, computed from the index without reading every note, worst first: problems (bad frontmatter, superseded notes outside the archive), broken_link, duplicate_candidates, old_inference (statements marked as inferred long ago), missing_page (a missing target linked from several notes), unlinked_mention (a note's name in plain text without a [[link]]), orphan (nothing links to it), stale (unchanged for long), oversized. Each item has the notes, a kind and a short detail; `counts` has the totals. It only finds candidates: read the notes and decide (merge, link, update, archive, split) before writing.",
+			inputSchema: {
+				kinds: z.array(z.enum(LINT_KINDS)).optional().describe("Only these kinds (default all)."),
+				folder: z.string().optional().describe("Only items that involve a note in this top-level folder."),
+				limit: z.number().int().min(1).max(500).optional().describe("Default 50."),
+			},
+			annotations: read,
+		},
+		wrap("lint", (a: { kinds?: string[]; folder?: string; limit?: number }) => memory.lint(a)),
 	);
 
 	if (clients) {
@@ -230,11 +269,28 @@ export async function createMcpServer(memory: MemoryService, client: ClientIdent
 	);
 
 	server.registerTool(
+		"revert",
+		{
+			title: "Undo a change",
+			description:
+				"Undoes a previous commit (a hash from `recent` or `history`) with a new commit: every note it touched goes back to how it was before it. Give path or name to undo only what it did to that note. Undoing a create deletes the note (refused with HAS_BACKLINKS while other notes link to it); undoing a delete brings it back; undoing a move moves it back. Later changes to the same notes are kept when they don't overlap, otherwise it fails with REVERT_CONFLICT and changes nothing. Binary attachments can be removed or moved back but not restored (NOT_RESTORABLE).",
+			inputSchema: {
+				commit: z.string().describe("The commit to undo, e.g. a hash from `recent` or `history`."),
+				path: notePath.describe("Only undo what the commit did to this note. Give path, name or neither."),
+				name: noteName.describe("Only undo what the commit did to the note with this name."),
+				reason,
+			},
+			annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+		},
+		wrap("revert", (a: { commit: string; path?: string; name?: string; reason: string }) => memory.revert(client, a)),
+	);
+
+	server.registerTool(
 		"attach",
 		{
 			title: "Attach a file",
 			description:
-				"Stores a binary (PDF, image…) with git LFS and creates a companion note next to it with its text (PDFs) so it can be searched. Send the bytes as base64 for small files, or upload first with PUT /uploads/<filename> and pass upload_id.",
+				"Stores a binary (PDF, image…) with git LFS and creates a companion note next to it with its text so it can be searched: PDFs via pdftotext, and scanned PDFs and images (png, jpg, webp, tiff) via OCR when the server has it. Send the bytes as base64 for small files, or upload first with PUT /uploads/<filename> and pass upload_id.",
 			inputSchema: {
 				path: z.string().describe("Where the file goes, e.g. «temas/escritura-casa.pdf»."),
 				upload_id: z.string().optional(),

@@ -4,11 +4,14 @@ import { parseArgs } from "node:util";
 import { ForgejoOAuthProvider } from "./auth/oauth.js";
 import { addToken, listTokens, revokeToken } from "./auth/tokens.js";
 import { buildClientsReport, ClientActivity, renderClientsTable } from "./clients.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, readSecretFile } from "./config.js";
 import { Git } from "./git.js";
+import { CONVENTIONS_FILE, defaultConventions, parseConventions } from "./conventions.js";
+import { lint, renderLint } from "./lint.js";
 import { jsonLogger } from "./log.js";
 import { MemoryService } from "./memory.js";
 import { applyMigration, planMigration, renderPlan } from "./migrate.js";
+import { SearchIndex } from "./search-index.js";
 import { startServer } from "./server.js";
 
 const USAGE = `my-memory — git-backed memory server for AI agents (MCP)
@@ -21,7 +24,9 @@ Usage:
   my-memory oauth list --config <file>
   my-memory oauth revoke <client_id|all> --config <file>
   my-memory clients [--json] --config <file>   who is connected: last seen, writes, setup version
-  my-memory reindex --config <file>          full rebuild of the index (stop the service first)
+  my-memory lint [--json] [--kind <k>[,<k>]] [--folder <f>] [--limit <n>] --config <file>
+                                             maintenance worklist (broken links, orphans, stale notes…)
+  my-memory reindex [--reembed] --config <file>   full rebuild of the index and missing embeddings (stop the service first)
   my-memory migrate <repo-dir> [--apply] [--conventions <memory.toml>]
 
 The config file is TOML; see the README for every key.
@@ -47,6 +52,10 @@ export async function main(argv: string[]): Promise<number> {
 			apply: { type: "boolean" },
 			conventions: { type: "string" },
 			json: { type: "boolean" },
+			reembed: { type: "boolean" },
+			kind: { type: "string" },
+			folder: { type: "string" },
+			limit: { type: "string" },
 			help: { type: "boolean", short: "h" },
 		},
 	});
@@ -139,19 +148,61 @@ export async function main(argv: string[]): Promise<number> {
 				provider?.close();
 			}
 		}
+		if (command === "lint") {
+			if (!values.config) throw new Error("lint needs --config");
+			const config = loadConfig(values.config, { secrets: false });
+			const repoDir = join(config.dataDir, "repo");
+			const conventionsText = await readFile(join(repoDir, CONVENTIONS_FILE), "utf8").catch(() => null);
+			const conventions = conventionsText === null ? defaultConventions() : parseConventions(conventionsText);
+			const limit = values.limit === undefined ? 500 : /^\d+$/.test(values.limit.trim()) ? Number(values.limit) : Number.NaN;
+			if (!(limit >= 1)) throw new Error(`--limit must be a positive whole number, not «${values.limit}»`);
+			// Reads the index the server keeps, read-only: safe while the server runs (SQLite WAL), and an index of
+			// another schema version is refused, never reset under a running server.
+			const index = new SearchIndex(join(config.dataDir, "index.sqlite"), { readOnly: true });
+			try {
+				if (!index.getMeta("indexed_commit")) throw new Error("the index is empty: start the server once or run «my-memory reindex»");
+				const report = lint(index, conventions, { kinds: values.kind?.split(",").map((k) => k.trim()).filter(Boolean), folder: values.folder, limit });
+				process.stdout.write(`${values.json ? JSON.stringify(report, null, 2) : renderLint(report)}
+`);
+				return 0;
+			} finally {
+				index.close();
+			}
+		}
 		if (command === "reindex") {
 			if (!values.config) throw new Error("reindex needs --config");
 			const config = loadConfig(values.config, { secrets: false });
+			let embeddings = config.embeddings;
+			if (embeddings?.apiKeyFile) {
+				try {
+					embeddings = { ...embeddings, apiKey: readSecretFile(embeddings.apiKeyFile) };
+				} catch (error) {
+					process.stderr.write(`Embeddings skipped: ${(error as Error).message}. The service embeds the missing sections when it starts.\n`);
+					embeddings = null;
+				}
+			}
 			const memory = new MemoryService({
 				repoDir: join(config.dataDir, "repo"),
 				indexPath: join(config.dataDir, "index.sqlite"),
 				branch: config.branch,
 				remote: null,
 				log: jsonLogger(),
+				embeddings,
 			});
 			await memory.start();
-			await memory.rebuildIndex();
-			await memory.stop();
+			try {
+				await memory.rebuildIndex({ reembed: values.reembed });
+				if (memory.embedder) {
+					try {
+						const r = await memory.embedder.flush();
+						process.stderr.write(`Embedded ${r.embedded} section(s); ${r.pending} pending.\n`);
+					} catch (error) {
+						process.stderr.write(`Embeddings failed: ${(error as Error).message}. The index is rebuilt; the service embeds the missing sections when it starts.\n`);
+					}
+				}
+			} finally {
+				await memory.stop();
+			}
 			return 0;
 		}
 		if (command === "migrate") {

@@ -216,6 +216,216 @@ describe("writing", () => {
 	});
 });
 
+describe("recent and revert", () => {
+	const repoGit = () => new Git(join(env!.root, "data/repo"));
+
+	it("lists recent commits with client, tool, reason and the notes they touched", async () => {
+		env = await makeMemory(SEED);
+		const m = env.memory;
+		await m.create({ ...writer, session: "s-1" }, { path: "personas/sara.md", content: note("Sara", "Amiga"), reason: "Nueva persona" });
+		await m.edit({ id: "otro", name: "Otro Agente", scope: "write" }, { name: "universidad", edits: [{ old_string: "Cinco", new_string: "Seis" }], reason: "Seis asignaturas" });
+		const piso = await m.read({ name: "piso-de-oviedo" });
+		await m.move(writer, { from: "piso-de-oviedo", to: "temas/piso.md", hash: piso.hash, reason: "Renombrar" });
+		await m.edit(writer, { name: "viejo", edits: [{ old_string: "antigua", new_string: "muy antigua" }], reason: "Solo archivo" });
+
+		const r = await m.recent({});
+		expect(r.commits.map((c) => c.reason)).toEqual(["Renombrar", "Seis asignaturas", "Nueva persona", "seed"]);
+		expect(r.commits[0]).toMatchObject({ author: "Test Writer", client: "test-writer", tool: "move" });
+		expect(r.commits[0]?.notes).toContainEqual({ path: "temas/piso.md", name: "piso", change: "moved", from: "temas/piso-de-oviedo.md" });
+		expect(r.commits[0]?.notes).toContainEqual({ path: "yo/perfil.md", name: "perfil", change: "modified" });
+		expect(r.commits[0]?.notes.map((n) => n.path)).not.toContain("archivo/viejo.md"); // archive hidden
+		expect(r.commits[2]).toMatchObject({ client: "test-writer", tool: "create", session: "s-1", notes: [{ path: "personas/sara.md", name: "sara", change: "added" }] });
+		expect(r.commits[3]).toMatchObject({ author: "Seeder", client: null, tool: null });
+
+		const withArchive = await m.recent({ include_archive: true, limit: 2 });
+		expect(withArchive.commits.map((c) => c.reason)).toEqual(["Solo archivo", "Renombrar"]);
+		expect((await m.recent({ folder: "archivo" })).commits[0]?.reason).toBe("Solo archivo");
+		expect((await m.recent({ client: "otro" })).commits.map((c) => c.reason)).toEqual(["Seis asignaturas"]);
+		expect((await m.recent({ client: "seeder" })).commits.map((c) => c.reason)).toEqual(["seed"]);
+		expect((await m.recent({ folder: "personas" })).commits.map((c) => c.reason)).toEqual(["Nueva persona"]);
+		expect((await m.recent({ since: "1d" })).commits).toHaveLength(4);
+		expect((await m.recent({ since: "2999-01-01" })).commits).toEqual([]);
+		await expectCode(m.recent({ since: "ayer" }), "INVALID_ARGUMENT");
+		await expectCode(m.recent({ folder: "../x" }), "INVALID_ARGUMENT");
+	});
+
+	it("reverts an edit with one attributed commit, keeping later changes that do not overlap", async () => {
+		env = await makeMemory(SEED);
+		const m = env.memory;
+		const first = await m.edit(writer, { name: "universidad", edits: [{ old_string: "Cinco", new_string: "Seis" }], reason: "Seis" });
+		await m.edit(writer, { name: "universidad", edits: [{ old_string: "En enero.", new_string: "En enero y junio." }], reason: "Junio" });
+		const r = await m.revert({ ...writer, session: "s-2" }, { commit: (first.commit as string).slice(0, 10), reason: "Eran cinco" });
+		expect(r).toMatchObject({ path: "temas/universidad.md", reverted: first.commit, changes: [{ path: "temas/universidad.md", change: "reverted" }], warnings: [] });
+		const text = (await m.read({ name: "universidad" })).content;
+		expect(text).toContain("Cinco asignaturas");
+		expect(text).toContain("En enero y junio.");
+		expect(r.hash).toBe((await m.read({ name: "universidad" })).hash);
+		const remoteLog = await new Git(env.root).out(["--git-dir", env.bare as string, "log", "-1", "--format=%an|%B"]);
+		expect(remoteLog).toContain("Test Writer|Eran cinco");
+		expect(remoteLog).toContain(`Reverts: ${first.commit}`);
+		expect(remoteLog).toContain("Session: s-2");
+		expect((await m.recent({ limit: 1 })).commits[0]).toMatchObject({ tool: "revert", reverts: first.commit });
+		expect(m.search({ query: "cinco" }).hits[0]?.path).toBe("temas/universidad.md");
+		// Done already: nothing to change.
+		const again = await m.revert(writer, { commit: first.commit as string, reason: "Otra vez" });
+		expect(again.warnings.map((w) => w.code)).toEqual(["NO_CHANGES"]);
+	});
+
+	it("refuses a revert that collides with later changes and leaves everything as it was", async () => {
+		env = await makeMemory(SEED);
+		const m = env.memory;
+		const first = await m.edit(writer, { name: "universidad", edits: [{ old_string: "Cinco", new_string: "Seis" }], reason: "Seis" });
+		const second = await m.edit(writer, { name: "universidad", edits: [{ old_string: "Seis", new_string: "Siete" }], reason: "Siete" });
+		const e = await expectCode(m.revert(writer, { commit: first.commit as string, reason: "x" }), "REVERT_CONFLICT");
+		expect(e.details).toMatchObject({ path: "temas/universidad.md", later_commits: [{ commit: second.commit, message: "Siete" }] });
+		expect(await repoGit().head()).toBe(second.commit);
+		expect(await repoGit().isClean()).toBe(true);
+		expect((await m.read({ name: "universidad" })).content).toContain("Siete asignaturas");
+	});
+
+	it("reverting a create deletes the note, but not while others link to it; reverting a delete restores it", async () => {
+		env = await makeMemory(SEED);
+		const m = env.memory;
+		const ana = await m.create(writer, { path: "personas/ana.md", content: note("Ana", "Prima"), reason: "Ana" });
+		const luis = await m.create(writer, { path: "personas/luis.md", content: note("Luis", "Primo", "Hermano de [[ana]]."), reason: "Luis" });
+		const e = await expectCode(m.revert(writer, { commit: ana.commit as string, reason: "Sin Ana" }), "HAS_BACKLINKS");
+		expect(e.details.backlinks).toEqual([{ src_path: "personas/luis.md", line: 7, target: "personas/ana.md" }]);
+		expect(await repoGit().isClean()).toBe(true);
+		const r = await m.revert(writer, { commit: luis.commit as string, reason: "Sin Luis" });
+		expect(r).toMatchObject({ changes: [{ path: "personas/luis.md", change: "removed" }], hash: null });
+		await expectCode(m.read({ name: "luis" }), "NOT_FOUND");
+		await m.revert(writer, { commit: ana.commit as string, reason: "Sin Ana" });
+		await expectCode(m.read({ name: "ana" }), "NOT_FOUND");
+
+		const perfil = await m.read({ name: "perfil" });
+		const del = await m.delete(writer, { name: "perfil", hash: perfil.hash, reason: "Fuera" });
+		const back = await m.revert(writer, { commit: del.commit as string, reason: "Volver" });
+		expect(back).toMatchObject({ path: "yo/perfil.md", hash: perfil.hash, changes: [{ path: "yo/perfil.md", change: "restored" }] });
+		expect(m.search({ query: "Alex" }).hits.map((h) => h.path)).toContain("yo/perfil.md");
+		expect(((await m.links({ name: "universidad", direction: "in" })) as { in: unknown[] }).in).toHaveLength(2);
+		// Created again in between: the old one does not overwrite it.
+		const del2 = await m.delete(writer, { name: "perfil", hash: perfil.hash, reason: "Fuera otra vez" });
+		await m.create(writer, { path: "yo/perfil.md", content: note("Perfil", "Nuevo perfil"), reason: "Nuevo", confirm_new: true });
+		await expectCode(m.revert(writer, { commit: del2.commit as string, reason: "x" }), "REVERT_CONFLICT");
+	});
+
+	it("reverts a move with its link rewrites, or only one note of it", async () => {
+		env = await makeMemory(SEED);
+		const m = env.memory;
+		const piso = await m.read({ name: "piso-de-oviedo" });
+		const mv = await m.move(writer, { from: "temas/piso-de-oviedo.md", to: "temas/piso.md", hash: piso.hash, reason: "Renombrar" });
+		const one = await m.revert(writer, { commit: mv.commit as string, name: "[[perfil]]", reason: "Solo el perfil" });
+		expect(one.changes).toEqual([{ path: "yo/perfil.md", change: "reverted" }]);
+		expect(one.warnings).toMatchObject([{ code: "BROKEN_LINKS", targets: ["piso-de-oviedo"], path: "yo/perfil.md" }]);
+		expect(await m.read({ name: "piso" })).toMatchObject({ path: "temas/piso.md" });
+		await expectCode(m.revert(writer, { commit: mv.commit as string, path: "temas/universidad.md", reason: "x" }), "NOT_FOUND");
+
+		const all = await m.revert(writer, { commit: mv.commit as string, reason: "Deshacer el cambio de nombre" });
+		expect(all.changes).toContainEqual({ path: "temas/piso-de-oviedo.md", change: "moved_back", from: "temas/piso.md" });
+		expect(all.changes).toContainEqual({ path: "archivo/viejo.md", change: "reverted" });
+		expect(all.changes).not.toContainEqual(expect.objectContaining({ path: "yo/perfil.md" })); // already back
+		expect((await m.read({ name: "piso-de-oviedo" })).content).toBe(piso.content);
+		await expectCode(m.read({ name: "piso" }), "NOT_FOUND");
+		expect(m.index.brokenLinks().filter((l) => l.srcPath !== "AGENTS.md")).toEqual([]);
+	});
+
+	it("refuses to undo a create when the note was moved since, also inside a commit with other files", async () => {
+		env = await makeMemory(SEED);
+		const m = env.memory;
+		const ana = await m.create(writer, { path: "temas/ana.md", content: note("Ana", "Prima"), reason: "Ana" });
+		const mv = await m.move(writer, { from: "temas/ana.md", to: "personas/ana.md", hash: (await m.read({ name: "ana" })).hash, reason: "A personas" });
+		const e = await expectCode(m.revert(writer, { commit: ana.commit as string, reason: "Sin Ana" }), "REVERT_CONFLICT");
+		expect(e.details).toMatchObject({ path: "temas/ana.md", later_commits: [{ commit: mv.commit, message: "A personas" }] });
+		expect(await m.read({ name: "ana" })).toMatchObject({ path: "personas/ana.md" });
+		expect(await repoGit().head()).toBe(mv.commit);
+		// Really deleted since: nothing left to undo.
+		const eva = await m.create(writer, { path: "temas/eva.md", content: note("Eva", "Vecina"), reason: "Eva" });
+		await m.delete(writer, { name: "eva", hash: (await m.read({ name: "eva" })).hash, reason: "Fuera" });
+		expect((await m.revert(writer, { commit: eva.commit as string, reason: "Sin Eva" })).warnings.map((w) => w.code)).toEqual(["NO_CHANGES"]);
+
+		// Two notes created in one commit, one of them moved later: nothing is reverted, not even the other one.
+		const other = await otherClone(env.root, env.bare as string);
+		await other.write("temas/bea.md", note("Bea", "Amiga"));
+		await other.write("temas/carla.md", note("Carla", "Amiga"));
+		await other.commitPush("Bea y Carla");
+		const both = (await other.git.out(["rev-parse", "HEAD"])).trim();
+		m.requestSync("webhook");
+		await new Promise((r) => setTimeout(r, 400));
+		await m.idle();
+		const mv2 = await m.move(writer, { from: "temas/bea.md", to: "personas/bea.md", hash: (await m.read({ name: "bea" })).hash, reason: "Bea a personas" });
+		const e2 = await expectCode(m.revert(writer, { commit: both, reason: "Sin las dos" }), "REVERT_CONFLICT");
+		expect(e2.details.path).toBe("temas/bea.md");
+		expect(await repoGit().head()).toBe(mv2.commit);
+		expect(await repoGit().isClean()).toBe(true);
+		expect(await m.read({ name: "carla" })).toMatchObject({ path: "temas/carla.md" });
+		expect(await m.read({ name: "bea" })).toMatchObject({ path: "personas/bea.md" });
+	});
+
+	it("brings a file back byte for byte, and refuses paths the other writes refuse", async () => {
+		env = await makeMemory(SEED);
+		const m = env.memory;
+		const other = await otherClone(env.root, env.bare as string);
+		// Latin-1 «é» and CRLF: not valid UTF-8, so a round trip through a string would change the bytes.
+		const latin = Buffer.concat([Buffer.from(note("Latin", "Codificación antigua").replace("# Latin", "# Latin\r\nCaf")), Buffer.from([0xe9]), Buffer.from(" con leche\r\n")]);
+		await writeFile(join(other.dir, "temas/latin.md"), latin);
+		await other.write(".gitignore", "*.tmp\n");
+		await other.write("temas/nueva.md", note("Nueva", "Con gitignore"));
+		await other.commitPush("Latin, nueva y gitignore");
+		const added = (await other.git.out(["rev-parse", "HEAD"])).trim();
+		m.requestSync("webhook");
+		await new Promise((r) => setTimeout(r, 400));
+		await m.idle();
+		const file = join(env.root, "data/repo/temas/latin.md");
+		expect(await readFile(file)).toEqual(latin);
+		const ed = await m.edit(writer, { name: "latin", edits: [{ old_string: "con leche", new_string: "solo" }], reason: "Solo" });
+		expect(await readFile(file)).not.toEqual(latin);
+		await m.revert(writer, { commit: ed.commit as string, reason: "Con leche" });
+		expect(await readFile(file)).toEqual(latin);
+
+		// .gitignore is a hidden file: the whole commit cannot be reverted, one note of it can.
+		const e = await expectCode(m.revert(writer, { commit: added, reason: "x" }), "INVALID_PATH");
+		expect(e.details.path).toBe(".gitignore");
+		expect(await repoGit().isClean()).toBe(true);
+		expect(await readFile(join(env.root, "data/repo/.gitignore"), "utf8")).toBe("*.tmp\n");
+		const one = await m.revert(writer, { commit: added, path: "temas/nueva.md", reason: "Sin la nueva" });
+		expect(one.changes).toEqual([{ path: "temas/nueva.md", change: "removed" }]);
+	});
+
+	it("validates the commit and the client", async () => {
+		env = await makeMemory(SEED);
+		const m = env.memory;
+		const first = await m.edit(writer, { name: "universidad", edits: [{ old_string: "Cinco", new_string: "Seis" }], reason: "Seis" });
+		await expectCode(m.revert(writer, { commit: "0123456789abcdef", reason: "x" }), "INVALID_REVISION");
+		await expectCode(m.revert(writer, { commit: "--all", reason: "x" }), "INVALID_REVISION");
+		await expectCode(m.revert(writer, { commit: "", reason: "x" }), "INVALID_ARGUMENT");
+		const tree = (await repoGit().out(["rev-parse", "HEAD^{tree}"])).trim();
+		const dangling = (await repoGit().run(["commit-tree", tree, "-m", "fuera de la rama"])).stdout.trim();
+		await expectCode(m.revert(writer, { commit: dangling, reason: "x" }), "INVALID_REVISION");
+		await expectCode(m.revert(reader, { commit: first.commit as string, reason: "x" }), "FORBIDDEN");
+		await expectCode(m.revert(writer, { commit: first.commit as string, reason: "" }), "INVALID_ARGUMENT");
+		expect(await repoGit().head()).toBe(first.commit);
+	});
+
+	it("removes an attachment when undoing attach, but never rewrites a binary from history", { timeout: 60_000 }, async () => {
+		env = await makeMemory(SEED);
+		const m = env.memory;
+		if (!(await m.git.lfsAvailable())) return;
+		const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1, 2, 3]).toString("base64");
+		const att = await m.attach(writer, { path: "temas/foto.png", source: { base64: png }, description: "Una foto", reason: "Foto" });
+		const attrs = await readFile(join(env.root, "data/repo/.gitattributes"), "utf8");
+		const undo = await m.revert(writer, { commit: att.commit as string, reason: "Sin foto" });
+		expect((undo.changes as { path: string }[]).map((c) => c.path).sort()).toEqual(["temas/foto.md", "temas/foto.png"]);
+		expect(await readFile(join(env.root, "data/repo/.gitattributes"), "utf8")).toBe(attrs); // LFS rules stay
+		await expectCode(m.read({ name: "foto" }), "NOT_FOUND");
+		const e = await expectCode(m.revert(writer, { commit: undo.commit as string, reason: "Volver a poner la foto" }), "NOT_RESTORABLE");
+		expect(e.details.path).toBe("temas/foto.png");
+		expect(await repoGit().isClean()).toBe(true);
+		// The note alone can come back.
+		const back = await m.revert(writer, { commit: undo.commit as string, path: "temas/foto.md", reason: "Solo la nota" });
+		expect(back.changes).toEqual([{ path: "temas/foto.md", change: "restored" }]);
+	});
+});
+
 describe("remote sync", () => {
 	it("integrates pushes from elsewhere (webhook) and rebases local writes on top", async () => {
 		env = await makeMemory(SEED);

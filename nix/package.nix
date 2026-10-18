@@ -6,7 +6,18 @@
   git,
   git-lfs,
   poppler-utils,
+  tesseract,
 }:
+
+let
+  # OCR for scanned PDFs and images; only the language data the default config uses.
+  tesseractOcr = tesseract.override {
+    enableLanguages = [
+      "eng"
+      "spa"
+    ];
+  };
+in
 
 buildNpmPackage {
   pname = "my-memory";
@@ -31,7 +42,8 @@ buildNpmPackage {
 
   nativeBuildInputs = [ makeWrapper ];
 
-  # git, git-lfs and pdftotext are called as programs; the wrapper puts the pinned ones first.
+  # git, git-lfs, poppler (pdftotext, pdftoppm) and tesseract are called as programs; the wrapper
+  # puts the pinned ones first. OCR stays optional at runtime: without them it is just unavailable.
   postInstall = ''
     wrapProgram $out/bin/my-memory \
       --prefix PATH : ${
@@ -39,6 +51,7 @@ buildNpmPackage {
           git
           git-lfs
           poppler-utils
+          tesseractOcr
         ]
       }
   '';

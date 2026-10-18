@@ -1,7 +1,9 @@
 import { readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { parse as parseToml } from "smol-toml";
+import type { EmbeddingsConfig } from "./embeddings.js";
 import type { Level } from "./log.js";
+import { defaultOcrSettings, type OcrSettings } from "./ocr.js";
 
 export interface Listen {
 	address: string;
@@ -27,7 +29,10 @@ export interface ServerConfig {
 		refreshTtlSeconds: number;
 	} | null;
 	fetchIntervalSeconds: number;
+	/** Optional semantic search; null keeps search full-text only. */
+	embeddings: (EmbeddingsConfig & { apiKeyFile: string | null }) | null;
 	pdftotext: string;
+	ocr: OcrSettings;
 	logLevel: Level;
 }
 
@@ -53,10 +58,65 @@ function readSecret(value: unknown, key: string, base: string, read = true): str
 	return text;
 }
 
+/** Reads a secret named in the config (a path or `credential:NAME`); for the CLI, which loads configs without secrets. */
+export function readSecretFile(value: string): string {
+	const text = readFileSync(secretPath(value, process.cwd()), "utf8").trim();
+	if (!text) throw new Error(`${value}: the file is empty`);
+	return text;
+}
+
+function num(v: unknown, key: string, fallback: number, min: number): number {
+	if (v === undefined) return fallback;
+	if (typeof v !== "number" || !Number.isFinite(v) || v < min) throw new Error(`${key} must be a number >= ${min}`);
+	return v;
+}
+
+function embeddings(t: Record<string, unknown> | undefined, base: string, read: boolean): ServerConfig["embeddings"] {
+	if (!t) return null;
+	const url = str(t.url, "embeddings.url");
+	if (!/^https?:\/\//.test(url)) throw new Error("embeddings.url must be an http(s) URL");
+	const keyFile = t.api_key_file === undefined ? null : str(t.api_key_file, "embeddings.api_key_file");
+	return {
+		url,
+		model: str(t.model, "embeddings.model"),
+		apiKey: readSecret(t.api_key_file, "embeddings.api_key_file", base, read),
+		apiKeyFile: keyFile === null || keyFile.startsWith("credential:") ? keyFile : secretPath(keyFile, base),
+		dimensions: t.dimensions === undefined ? null : Math.floor(num(t.dimensions, "embeddings.dimensions", 0, 1)),
+		batchSize: Math.floor(num(t.batch_size, "embeddings.batch_size", 32, 1)),
+		timeoutSeconds: num(t.timeout_seconds, "embeddings.timeout_seconds", 60, 1),
+		queryPrefix: t.query_prefix === undefined ? "" : String(t.query_prefix),
+		documentPrefix: t.document_prefix === undefined ? "" : String(t.document_prefix),
+	};
+}
+
 function str(v: unknown, key: string, fallback?: string): string {
 	if (v === undefined && fallback !== undefined) return fallback;
 	if (typeof v !== "string" || !v) throw new Error(`${key} must be a non-empty string`);
 	return v;
+}
+
+function positiveInt(v: unknown, key: string, fallback: number): number {
+	if (v === undefined) return fallback;
+	if (typeof v !== "number" || !Number.isInteger(v) || v < 1) throw new Error(`${key} must be a positive integer`);
+	return v;
+}
+
+function ocrSettings(v: unknown): OcrSettings {
+	if (v === undefined) return { ...defaultOcrSettings };
+	if (typeof v !== "object" || v === null || Array.isArray(v)) throw new Error("[ocr] must be a table");
+	const t = v as Record<string, unknown>;
+	if (t.enabled !== undefined && typeof t.enabled !== "boolean") throw new Error("ocr.enabled must be true or false");
+	const languages = str(t.languages, "ocr.languages", defaultOcrSettings.languages);
+	if (!/^[A-Za-z0-9_]+(\+[A-Za-z0-9_]+)*$/.test(languages)) throw new Error("ocr.languages must be tesseract language codes joined with +, e.g. \"spa+eng\"");
+	return {
+		enabled: t.enabled ?? defaultOcrSettings.enabled,
+		languages,
+		maxPages: positiveInt(t.max_pages, "ocr.max_pages", defaultOcrSettings.maxPages),
+		pageTimeoutSeconds: positiveInt(t.page_timeout_seconds, "ocr.page_timeout_seconds", defaultOcrSettings.pageTimeoutSeconds),
+		dpi: positiveInt(t.dpi, "ocr.dpi", defaultOcrSettings.dpi),
+		tesseract: str(t.tesseract, "ocr.tesseract", defaultOcrSettings.tesseract),
+		pdftoppm: str(t.pdftoppm, "ocr.pdftoppm", defaultOcrSettings.pdftoppm),
+	};
 }
 
 function listen(v: unknown, key: string): Listen | null {
@@ -98,7 +158,9 @@ export function loadConfig(file: string, opts: { secrets?: boolean } = {}): Serv
 				}
 			: null,
 		fetchIntervalSeconds: typeof doc.fetch_interval_seconds === "number" ? doc.fetch_interval_seconds : 300,
+		embeddings: embeddings(doc.embeddings as Record<string, unknown> | undefined, base, read),
 		pdftotext: str(doc.pdftotext, "pdftotext", "pdftotext"),
+		ocr: ocrSettings(doc.ocr),
 		logLevel: (["debug", "info", "warn", "error"].includes(doc.log_level as string) ? doc.log_level : "info") as Level,
 	};
 	if (config.listen.public) {

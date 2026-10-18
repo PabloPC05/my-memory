@@ -1,30 +1,39 @@
 import { existsSync } from "node:fs";
-import { copyFile, lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { stringify as stringifyYaml } from "yaml";
 import { CONVENTIONS_FILE, type Conventions, defaultConventions, parseConventions } from "./conventions.js";
+import { dot, EmbeddingClient, Embedder, type EmbeddingsConfig, reciprocalRankFusion } from "./embeddings.js";
 import { MemoryError } from "./errors.js";
-import { extractPdf, type Extraction } from "./extract.js";
+import { extractAttachment, type Extraction } from "./extract.js";
 import { parseNote, splitFrontmatter } from "./frontmatter.js";
 import { Git } from "./git.js";
+import { type LintArgs, lint } from "./lint.js";
 import { type Logger, silentLogger } from "./log.js";
-import { firstH1, rewriteWikiLinks, splitSections } from "./markdown.js";
+import { firstH1, rewriteWikiLinks, splitSections, targetNameOf } from "./markdown.js";
+import type { OcrRunner } from "./ocr.js";
 import { parseTypedLinks } from "./relations.js";
 import { SETUP_GUIDE_URI, SETUP_GUIDE_URL } from "./setup-guide.js";
-import { buildFtsQuery, type NoteRow, SearchIndex } from "./search-index.js";
+import { buildFtsQuery, type NoteRow, type SearchHit, SearchIndex } from "./search-index.js";
 import type { UploadStore } from "./uploads.js";
 import {
 	blobHash,
 	checkNewFilename,
 	checkPath,
 	dirOf,
+	type FileChange,
 	joinPath,
 	levenshtein,
+	lookAlikeLabels,
 	looksLikeSame,
 	Mutex,
 	normalizeWords,
+	noteLabels,
 	noteName,
+	parseNameStatus,
+	parseSince,
 	sha256,
 	topFolder,
 } from "./util.js";
@@ -55,13 +64,22 @@ export interface MemoryOptions {
 	committer?: { name: string; email: string };
 	uploads?: UploadStore | null;
 	pdftotext?: string;
+	/** OCR for scanned PDFs and images; null or absent means no OCR. */
+	ocr?: OcrRunner | null;
 	log?: Logger;
 	pushRetry?: { initialMs: number; maxMs: number };
 	fetchIntervalMs?: number;
+	/** Optional semantic search through an embeddings endpoint; without it search is full-text only. */
+	embeddings?: EmbeddingsConfig | null;
+	embeddingsRetry?: { initialMs: number; maxMs: number };
 }
 
+export type SearchMode = "hybrid" | "text" | "semantic";
+
+type SearchArgs = { query: string; folder?: string; include_archive?: boolean; limit?: number };
+
 export interface Warning {
-	code: "BROKEN_LINKS" | "UNKNOWN_RELATIONS" | "PUSH_PENDING" | "EXTRACTION_EMPTY" | "NO_CHANGES" | "FRONTMATTER_PROBLEMS";
+	code: "BROKEN_LINKS" | "UNKNOWN_RELATIONS" | "PUSH_PENDING" | "EXTRACTION_EMPTY" | "EXTRACTION_PARTIAL" | "NO_CHANGES" | "FRONTMATTER_PROBLEMS";
 	message: string;
 	[key: string]: unknown;
 }
@@ -77,6 +95,24 @@ export interface WriteResult {
 type NoteRef = { path?: string; name?: string };
 
 const READ_ONLY = new MemoryError("FORBIDDEN", "This client has read-only access.");
+
+/** git's empty tree: the "parent" of a root commit. */
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/** One commit as `recent` returns it. */
+export interface RecentCommit {
+	commit: string;
+	date: string;
+	author: string;
+	client: string | null;
+	tool: string | null;
+	session?: string;
+	reverts?: string;
+	reason: string;
+	notes: { path: string; name?: string; change: "added" | "modified" | "deleted" | "moved" | "copied"; from?: string }[];
+}
+
+const CHANGE_NAMES: Record<string, RecentCommit["notes"][number]["change"]> = { A: "added", M: "modified", T: "modified", D: "deleted", R: "moved", C: "copied" };
 
 /**
  * The memory: a git working clone of the notes repo plus its derived index.
@@ -97,6 +133,8 @@ export class MemoryService {
 	private fetchTimer: NodeJS.Timeout | null = null;
 	private syncTimer: NodeJS.Timeout | null = null;
 	private syncRequested = false;
+	/** Background embedding of sections; null when `[embeddings]` is not configured. */
+	readonly embedder: Embedder | null = null;
 
 	constructor(readonly opts: MemoryOptions) {
 		this.log = opts.log ?? silentLogger;
@@ -108,6 +146,7 @@ export class MemoryService {
 			config["http.extraHeader"] = `Authorization: Basic ${basic}`;
 		}
 		this.git = new Git(opts.repoDir, { config });
+		if (opts.embeddings) this.embedder = new Embedder(new EmbeddingClient(opts.embeddings), () => this.index, this.log, opts.embeddingsRetry);
 	}
 
 	// ── lifecycle ────────────────────────────────────────────────────────────
@@ -148,7 +187,12 @@ export class MemoryService {
 		}
 		await this.loadConventions();
 		this.index = new SearchIndex(this.opts.indexPath);
+		this.embedder?.checkModel();
 		await this.reconcileIndex();
+		if (this.embedder) {
+			this.log("info", "embeddings.status", this.embedder.status());
+			this.embedder.schedule();
+		}
 		if (this.opts.remote) {
 			await this.lock.run(() => this.syncLocked("startup")).catch((error) => this.log("warn", "sync.startup_failed", { error: String(error) }));
 		}
@@ -161,6 +205,7 @@ export class MemoryService {
 	async stop(): Promise<void> {
 		for (const t of [this.pushTimer, this.fetchTimer, this.syncTimer]) if (t) clearTimeout(t);
 		await this.lock.run(async () => undefined);
+		await this.embedder?.stop();
 		this.index?.close();
 	}
 
@@ -292,6 +337,7 @@ export class MemoryService {
 			throw error;
 		}
 		this.log("info", "index.full", { files: files.length, ms: Date.now() - started, ...this.index.counts() });
+		this.embedder?.schedule();
 	}
 
 	private async incrementalReindex(from: string, to: string): Promise<void> {
@@ -336,6 +382,7 @@ export class MemoryService {
 			throw error;
 		}
 		this.log("info", "index.incremental", { changed: changed.length, ms: Date.now() - started });
+		this.embedder?.schedule();
 	}
 
 	/** Brings the index to HEAD: nothing, incremental, or a full rebuild if it cannot tell what changed. */
@@ -348,10 +395,11 @@ export class MemoryService {
 		return this.fullReindex(head);
 	}
 
-	/** Full rebuild on demand (`my-memory reindex --full`). */
-	async rebuildIndex(): Promise<void> {
+	/** Full rebuild on demand (`my-memory reindex`). `reembed` also drops every vector, so all sections are embedded again. */
+	async rebuildIndex(opts: { reembed?: boolean } = {}): Promise<void> {
 		await this.lock.run(async () => {
 			await this.loadConventions();
+			if (opts.reembed) this.index.clearVectors();
 			await this.fullReindex(await this.git.head());
 		});
 	}
@@ -494,7 +542,7 @@ export class MemoryService {
 		return readFile(this.abs(path), "utf8");
 	}
 
-	private async writeText(path: string, content: string): Promise<void> {
+	private async writeText(path: string, content: string | Buffer): Promise<void> {
 		const abs = this.abs(path);
 		await mkdir(dirname(abs), { recursive: true });
 		const tmp = `${abs}.${randomBytes(6).toString("hex")}.tmp`;
@@ -591,7 +639,7 @@ export class MemoryService {
 		return this.index
 			.allNotes()
 			.filter((n) => n.path !== exclude)
-			.filter((n) => [n.name, n.title ?? "", ...n.aliases].some((l) => l && wanted.some((w) => looksLikeSame(l, w))))
+			.filter((n) => lookAlikeLabels(noteLabels(n), wanted) !== null)
 			.slice(0, 10)
 			.map((n) => ({ path: n.path, name: n.name, description: n.description }));
 	}
@@ -612,9 +660,10 @@ export class MemoryService {
 		if (hash !== now) throw new MemoryError("CONFLICT", `«${path}» changed since you read it.`, { path, hash: now, content: current });
 	}
 
-	private commitMessage(client: ClientIdentity, tool: string, reason: string): string {
+	private commitMessage(client: ClientIdentity, tool: string, reason: string, extra: Record<string, string> = {}): string {
 		const trailers = [`Client: ${client.id}`, `Tool: ${tool}`];
 		if (client.session) trailers.push(`Session: ${client.session.replace(/\s+/g, " ").slice(0, 200)}`);
+		for (const [key, value] of Object.entries(extra)) trailers.push(`${key}: ${value}`);
 		return `${reason}\n\n${trailers.join("\n")}\n`;
 	}
 
@@ -631,7 +680,7 @@ export class MemoryService {
 		client: ClientIdentity,
 		tool: string,
 		rawReason: unknown,
-		apply: () => Promise<{ paths: string[]; result: { path: string; [k: string]: unknown }; warnings?: Warning[]; contentPath?: string }>,
+		apply: () => Promise<{ paths: string[]; result: { path: string; [k: string]: unknown }; warnings?: Warning[]; contentPath?: string; trailers?: Record<string, string> }>,
 	): Promise<WriteResult> {
 		if (client.scope !== "write") return Promise.reject(READ_ONLY);
 		let reason: string;
@@ -654,7 +703,7 @@ export class MemoryService {
 					const hash = (await this.exists(contentPath)) ? blobHash(await this.readText(contentPath)) : null;
 					return { commit: before, hash, ...applied.result, warnings: [...(applied.warnings ?? []), { code: "NO_CHANGES" as const, message: "Nothing changed; no commit was made." }] };
 				}
-				await this.git.run(["commit", "-q", "--no-verify", "-F", "-"], { input: this.commitMessage(client, tool, reason), env: this.authorEnv(client) });
+				await this.git.run(["commit", "-q", "--no-verify", "-F", "-"], { input: this.commitMessage(client, tool, reason, applied.trailers), env: this.authorEnv(client) });
 			} catch (error) {
 				await this.restoreWorktree(before).catch((e) => this.log("error", "worktree.restore_failed", { error: String(e) }));
 				throw error;
@@ -765,20 +814,72 @@ export class MemoryService {
 		};
 	}
 
-	search(args: { query: string; folder?: string; include_archive?: boolean; limit?: number }) {
+	private searchOpts(args: SearchArgs) {
+		return { folder: args.folder ? args.folder.replace(/\/+$/, "") : null, includeArchive: args.include_archive ?? false, limit: Math.min(Math.max(args.limit ?? 10, 1), 50) };
+	}
+
+	private ftsQuery(args: SearchArgs) {
 		const q = buildFtsQuery(args.query ?? "");
 		if (!q) throw new MemoryError("INVALID_ARGUMENT", "The query has no words to search for.");
-		const opts = { folder: args.folder ? args.folder.replace(/\/+$/, "") : null, includeArchive: args.include_archive ?? false, limit: Math.min(Math.max(args.limit ?? 10, 1), 50) };
+		return q;
+	}
+
+	private textHits(args: SearchArgs, limit?: number): { mode: "all" | "any"; hits: SearchHit[] } {
+		const q = this.ftsQuery(args);
+		const opts = { ...this.searchOpts(args), ...(limit ? { limit } : {}) };
 		let mode: "all" | "any" = "all";
 		let hits = this.index.search(q.and, opts);
 		if (hits.length === 0 && q.or !== q.and) {
 			hits = this.index.search(q.or, opts);
 			mode = "any";
 		}
-		return {
-			mode,
-			hits: hits.map((h) => ({ path: h.path, name: h.name, description: h.description, section: { heading: h.section.heading, level: h.section.level, line_start: h.section.lineStart, line_end: h.section.lineEnd }, snippet: h.snippet, score: h.score })),
-		};
+		return { mode, hits };
+	}
+
+	private static hitsOut(hits: (SearchHit | null)[]) {
+		return hits
+			.filter((h): h is SearchHit => h !== null)
+			.map((h) => ({ path: h.path, name: h.name, description: h.description, section: { heading: h.section.heading, level: h.section.level, line_start: h.section.lineStart, line_end: h.section.lineEnd }, snippet: h.snippet, score: h.score }));
+	}
+
+	/** Full-text search only (bm25). */
+	search(args: SearchArgs) {
+		const { mode, hits } = this.textHits(args);
+		return { mode, hits: MemoryService.hitsOut(hits) };
+	}
+
+	/**
+	 * The `search` tool. With embeddings configured, `hybrid` (the default) fuses the full-text ranking with the
+	 * ranking by cosine similarity to the query's vector (Reciprocal Rank Fusion), and `semantic` uses the vectors
+	 * alone. If the query cannot be embedded, the answer is the full-text search, the same as without embeddings.
+	 */
+	async searchAny(args: SearchArgs & { mode?: SearchMode }) {
+		const want = this.embedder ? (args.mode ?? "hybrid") : "text";
+		if (want === "text") return this.search(args);
+		const opts = this.searchOpts(args);
+		const pool = Math.max(opts.limit * 3, 30);
+		this.ftsQuery(args); // the same error as a text search, before calling the endpoint
+		const vector = await (this.embedder as Embedder).embedQuery(args.query);
+		if (!vector) return this.search(args);
+		// Everything below reads the index synchronously, after the await: a reindex cannot renumber the sections in between.
+		const ranked = this.index
+			.sectionVectors(opts)
+			.filter((s) => s.vector.length === vector.length)
+			.map((s) => ({ id: s.sectionId, similarity: dot(s.vector, vector) }))
+			.sort((a, b) => b.similarity - a.similarity)
+			.slice(0, pool);
+		const round = (x: number) => Math.round(x * 10_000) / 10_000;
+		if (want === "semantic") {
+			return { mode: "semantic" as const, hits: MemoryService.hitsOut(ranked.slice(0, opts.limit).map((r) => this.index.sectionHit(r.id, round(r.similarity)))) };
+		}
+		const text = this.textHits(args, pool);
+		const byId = new Map(text.hits.map((h) => [h.sectionId, h]));
+		const fused = [...reciprocalRankFusion([text.hits.map((h) => h.sectionId), ranked.map((r) => r.id)])].sort((a, b) => b[1] - a[1]).slice(0, opts.limit);
+		const hits = fused.map(([id, score]) => {
+			const h = byId.get(id);
+			return h ? { ...h, score: round(score) } : this.index.sectionHit(id, round(score));
+		});
+		return { mode: "hybrid" as const, hits: MemoryService.hitsOut(hits) };
 	}
 
 	async read(args: NoteRef & { section?: string; revision?: string }) {
@@ -880,6 +981,77 @@ export class MemoryService {
 			});
 		if (commits.length === 0) throw new MemoryError("NOT_FOUND", `No history for «${path}».`);
 		return { path, commits };
+	}
+
+	/**
+	 * The latest commits on the branch, newest first, with the files each one touched.
+	 * Files only in the archive are left out (and commits that touched nothing else) unless include_archive.
+	 */
+	async recent(args: { limit?: number; since?: string; folder?: string; client?: string; include_archive?: boolean }): Promise<{ commits: RecentCommit[]; since?: string }> {
+		const limit = Math.min(Math.max(args.limit ?? 20, 1), 200);
+		const since = args.since?.trim() ? parseSince(args.since) : null;
+		const folder = args.folder ? args.folder.trim().replace(/^\.\/|\/+$/g, "") : null;
+		if (folder !== null && (folder === "" || folder.startsWith("-") || folder.split("/").some((p) => p === "" || p.startsWith(".")))) {
+			throw new MemoryError("INVALID_ARGUMENT", `Invalid folder «${args.folder}».`);
+		}
+		const archive = this.conventions.folders.archive;
+		const includeArchive = args.include_archive ?? (folder !== null && folder === archive);
+		const hidden = (p: string) => !includeArchive && archive !== null && topFolder(p) === archive;
+		const client = args.client?.trim().toLowerCase() || null;
+		if (!(await this.git.head())) return { commits: [] };
+		const commits: RecentCommit[] = [];
+		// Filters that drop commits after git has listed them read the log in pages.
+		const page = client || since || !includeArchive ? Math.max(limit * 4, 100) : limit;
+		for (let skip = 0; commits.length < limit; skip += page) {
+			const out = await this.git.out([
+				"log",
+				`-n${page}`,
+				`--skip=${skip}`,
+				"-M",
+				"--name-status",
+				"--format=%x1e%H%x1f%aI%x1f%an%x1f%s%x1f%(trailers:only=true,unfold=true)%x1f",
+				...(since ? [`--since=${since}`] : []),
+				...(folder ? ["--full-diff", "--", `${folder}/`] : []),
+			]);
+			const blocks = out.split("\x1e").filter((b) => b.trim());
+			for (const block of blocks) {
+				const [commit, date, author, reason, trailerText, files] = block.split("\x1f") as string[];
+				const trailers: Record<string, string> = {};
+				for (const line of (trailerText ?? "").split("\n")) {
+					const m = /^([\w-]+):\s*(.*)$/.exec(line.trim());
+					if (m) trailers[m[1] as string] = m[2] as string;
+				}
+				if (client && trailers.Client?.toLowerCase() !== client && author?.toLowerCase() !== client) continue;
+				if (since && Date.parse(date as string) < Date.parse(since)) continue; // git's --since is a hint, not exact
+				const changes = parseNameStatus(files ?? "");
+				const visible = changes.filter((c) => !hidden(c.path) || (c.from !== undefined && !hidden(c.from)));
+				if (changes.length > 0 && visible.length === 0) continue;
+				commits.push({
+					commit: commit as string,
+					date: date as string,
+					author: author as string,
+					client: trailers.Client ?? null,
+					tool: trailers.Tool ?? null,
+					...(trailers.Session ? { session: trailers.Session } : {}),
+					...(trailers.Reverts ? { reverts: trailers.Reverts } : {}),
+					reason: reason as string,
+					notes: visible.map((c) => ({
+						path: c.path,
+						...(/\.md$/i.test(c.path) ? { name: noteName(c.path) } : {}),
+						change: CHANGE_NAMES[c.status] ?? "modified",
+						...(c.from ? { from: c.from } : {}),
+					})),
+				});
+				if (commits.length === limit) break;
+			}
+			if (blocks.length < page) break;
+		}
+		return { commits, ...(since ? { since } : {}) };
+	}
+
+	/** Maintenance worklist from the index (see lint.ts). `nowMs` is for tests. */
+	lint(args: LintArgs = {}, nowMs: number = Date.now()) {
+		return lint(this.index, this.conventions, args, nowMs);
 	}
 
 	// ── write tools ──────────────────────────────────────────────────────────
@@ -1035,6 +1207,205 @@ export class MemoryService {
 		});
 	}
 
+	/** Full hash of a commit given by a client, which must be on the current branch. */
+	private async branchCommit(input: unknown): Promise<string> {
+		const rev = typeof input === "string" ? input.trim() : "";
+		if (!rev) throw new MemoryError("INVALID_ARGUMENT", "«commit» is required: a hash from `recent` or `history`.");
+		if (!/^[\w./~^@{}-]+$/.test(rev) || rev.startsWith("-") || !(await this.git.exists(rev))) throw new MemoryError("INVALID_REVISION", `Unknown commit «${rev}».`);
+		const full = (await this.git.out(["rev-parse", "--verify", `${rev}^{commit}`])).trim();
+		const onBranch = (await this.git.run(["merge-base", "--is-ancestor", full, "HEAD"], { allowFail: true })).code === 0;
+		if (!onBranch) throw new MemoryError("INVALID_REVISION", `Commit «${rev}» is not part of the memory's history (branch ${this.branch}).`);
+		return full;
+	}
+
+	/** Blob id of a file at a revision, or null when it does not exist there. */
+	private async blobAt(rev: string, path: string): Promise<string | null> {
+		const r = await this.git.run(["rev-parse", "-q", "--verify", `${rev}:${path}`], { allowFail: true });
+		return r.code === 0 ? r.stdout.trim() : null;
+	}
+
+	private async blobText(id: string): Promise<string> {
+		return this.git.out(["cat-file", "blob", id]);
+	}
+
+	/** A blob as raw bytes, for files copied from history unchanged (no round trip through UTF-8). */
+	private async blobBytes(id: string): Promise<Buffer> {
+		return this.git.bytes(["cat-file", "blob", id]);
+	}
+
+	/** Three-way merge of text (`git merge-file`): the result, or null when the changes overlap. */
+	private async mergeText(ours: string, base: string, theirs: string): Promise<string | null> {
+		const dir = await mkdtemp(join(tmpdir(), "mm-merge-"));
+		try {
+			const files = ["ours", "base", "theirs"].map((f) => join(dir, f));
+			await Promise.all([ours, base, theirs].map((text, i) => writeFile(files[i] as string, text, "utf8")));
+			const r = await this.git.run(["merge-file", "-p", "-q", ...files], { allowFail: true });
+			return r.code === 0 ? r.stdout : null;
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	}
+
+	/**
+	 * Undoes a commit, or only what it did to one note: every file it touched goes back to its state before it,
+	 * as one new commit. Later changes to the same files are kept when they do not overlap (three-way merge);
+	 * otherwise nothing is changed and it fails with REVERT_CONFLICT. Binaries are never rewritten from history:
+	 * they can be removed (undoing an attach) or moved back, but not restored. `.gitattributes` is left alone.
+	 */
+	revert(client: ClientIdentity, args: NoteRef & { commit: string; reason: string }): Promise<WriteResult> {
+		return this.mutate(
+			client,
+			"revert",
+			args.reason,
+			async () => {
+				const target = await this.branchCommit(args.commit);
+				const short = target.slice(0, 12);
+				const parents = (await this.git.out(["rev-list", "--parents", "-n1", target])).trim().split(" ").slice(1);
+				if (parents.length > 1) throw new MemoryError("INVALID_REVISION", `«${short}» is a merge commit; revert the commits it brought in instead.`);
+				const base = parents[0] ?? EMPTY_TREE;
+				let changes: FileChange[] = parseNameStatus(await this.git.out(["diff", "-M", "--name-status", base, target])).filter((c) => c.path !== ".gitattributes" && c.from !== ".gitattributes");
+				let only: string | null = null;
+				if ((args.path ?? "").trim() || (args.name ?? "").trim()) {
+					if ((args.path ?? "").trim() && (args.name ?? "").trim()) throw new MemoryError("INVALID_ARGUMENT", "Give either «path» or «name», not both.");
+					const wanted = args.path?.trim() ? checkPath(args.path, this.conventions, "note") : null;
+					const key = wanted ? null : targetNameOf((args.name as string).trim().replace(/^!?\[\[|\]\]$/g, "").replace(/[#|].*$/, ""));
+					const matches = (p: string | undefined) => p !== undefined && /\.md$/i.test(p) && (wanted ? p === wanted : targetNameOf(p) === key);
+					changes = changes.filter((c) => matches(c.path) || matches(c.from));
+					if (changes.length === 0) throw new MemoryError("NOT_FOUND", `Commit ${short} did not touch «${args.path ?? args.name}».`);
+					if (changes.length > 1) throw new MemoryError("INVALID_ARGUMENT", `Several notes in ${short} match «${args.name}»; use «path».`, { paths: changes.map((c) => c.path) });
+					only = changes[0]?.path ?? null;
+				}
+				if (changes.length === 0) throw new MemoryError("NOT_RESTORABLE", `Commit ${short} changed nothing that can be reverted.`);
+
+				const isText = (p: string) => /\.md$/i.test(p) || !p.includes("/");
+				const notRestorable = (p: string) =>
+					new MemoryError("NOT_RESTORABLE", `«${p}» is a binary attachment; revert cannot bring its old content back. Attach the file again${only ? "" : ", or revert only the note with «path»"}.`, { path: p });
+				const conflict = async (p: string, why: string) => {
+					const later = (await this.git.out(["log", "--format=%H %s", `${target}..HEAD`, "--", p])).trim().split("\n").filter(Boolean);
+					return new MemoryError("REVERT_CONFLICT", `«${p}» ${why} since ${short}; nothing was reverted. Change it by hand instead.`, {
+						path: p,
+						later_commits: later.map((l) => ({ commit: l.slice(0, 40), message: l.slice(41) })),
+					});
+				};
+				let renamedLater: FileChange[] | null = null;
+				/** Whether a path was moved (renamed) by a later commit, as opposed to deleted. */
+				const movedSince = async (p: string) => {
+					renamedLater ??= parseNameStatus(await this.git.out(["log", "-M", "--diff-filter=R", "--name-status", "--format=", `${target}..HEAD`]));
+					return renamedLater.some((r) => r.from === p);
+				};
+				const writes = new Map<string, string>(); // text, for the checks below
+				const raw = new Map<string, Buffer>(); // exact bytes to write instead, for files copied from history unchanged
+				/** Old text back on top of the current one, keeping later changes that do not overlap. */
+				const restoreText = async (dest: string, p: string, now: string, was: string, old: string) => {
+					if (now === was) {
+						const bytes = await this.blobBytes(old);
+						raw.set(dest, bytes);
+						writes.set(dest, bytes.toString("utf8"));
+						return;
+					}
+					const merged = await this.mergeText(await this.blobText(now), await this.blobText(was), await this.blobText(old));
+					if (merged === null) throw await conflict(p, "was changed again where this commit changed it");
+					writes.set(dest, merged);
+				};
+
+				const removes = new Set<string>();
+				const renames: { from: string; to: string }[] = [];
+				const created = new Set<string>(); // paths that do not exist now and the revert brings back
+				const summary: { path: string; change: "restored" | "removed" | "reverted" | "moved_back"; from?: string }[] = [];
+				for (const c of changes) {
+					const now = await this.blobAt("HEAD", c.path);
+					const was = await this.blobAt(target, c.path);
+					if (c.status === "A" || c.status === "C") {
+						if (now === null) {
+							if (await movedSince(c.path)) throw await conflict(c.path, "was moved");
+							continue; // already gone
+						}
+						if (now !== was) throw await conflict(c.path, "was changed");
+						removes.add(c.path);
+						summary.push({ path: c.path, change: "removed" });
+					} else if (c.status === "D") {
+						const old = (await this.blobAt(base, c.path)) as string;
+						if (now === old) continue; // already back
+						if (now !== null) throw await conflict(c.path, "was created again");
+						if (!isText(c.path)) throw notRestorable(c.path);
+						await restoreText(c.path, c.path, old, old, old);
+						created.add(c.path);
+						summary.push({ path: c.path, change: "restored" });
+					} else if (c.status === "R" && c.from) {
+						const old = (await this.blobAt(base, c.from)) as string;
+						const nowOld = await this.blobAt("HEAD", c.from);
+						if (now === null && nowOld === old) continue; // already moved back
+						if (now === null) throw await conflict(c.path, "was moved or deleted");
+						if (nowOld !== null) throw await conflict(c.from, "was created again");
+						if (isText(c.path) && isText(c.from)) await restoreText(c.from, c.path, now, was as string, old);
+						else if (now === was && was === old) renames.push({ from: c.path, to: c.from });
+						else throw notRestorable(c.path);
+						removes.add(c.path);
+						created.add(c.from);
+						summary.push({ path: c.from, change: "moved_back", from: c.path });
+					} else {
+						const old = await this.blobAt(base, c.path);
+						if (now === old) continue; // already as it was
+						if (now === null || old === null) throw await conflict(c.path, "was deleted");
+						if (!isText(c.path)) throw notRestorable(c.path);
+						await restoreText(c.path, c.path, now, was as string, old);
+						summary.push({ path: c.path, change: "reverted" });
+					}
+				}
+
+				// The same rules as the other writes: allowed paths (no hidden files, allowed folders), unique names,
+				// valid frontmatter, no broken backlinks.
+				const touched = [...writes.keys(), ...removes, ...renames.map((r) => r.to)];
+				for (const p of new Set([...touched, ...renames.map((r) => r.from)])) checkPath(p, this.conventions, /\.md$/i.test(p) ? "note" : "asset");
+				for (const p of touched) await this.assertNoSymlink(p);
+				for (const p of created) {
+					const key = targetNameOf(p);
+					const taken = (/\.md$/i.test(p) ? this.index.notesByName(key).map((n) => n.path) : this.index.assetsByName(key)).filter((t) => t !== p && !removes.has(t));
+					if (taken.length) throw new MemoryError("NAME_TAKEN", `A note or file named «${key}» exists now at ${taken[0]}; names must be unique across folders.`, { path: p, existing: taken });
+				}
+				const kept = new Set([...created].map(targetNameOf));
+				const backlinks: { src_path: string; line: number; target: string }[] = [];
+				for (const p of removes) {
+					const key = targetNameOf(p);
+					if (kept.has(key)) continue; // moved back under the same name
+					for (const l of this.index.linksIn(p)) {
+						if (l.srcPath === p || removes.has(l.srcPath)) continue;
+						const after = writes.get(l.srcPath);
+						if (after !== undefined && !parseTypedLinks(after).some((x) => x.targetName === key)) continue;
+						backlinks.push({ src_path: l.srcPath, line: l.line, target: p });
+					}
+				}
+				if (backlinks.length) {
+					throw new MemoryError("HAS_BACKLINKS", `Reverting ${short} would remove notes that other notes link to; fix or remove those links first${only ? "" : ", or revert only one note with «path»"}.`, { backlinks });
+				}
+				const warnings: Warning[] = [];
+				for (const [p, text] of writes) {
+					if (!/\.md$/i.test(p)) continue;
+					const previous = (await this.exists(p)) ? await this.readText(p) : text;
+					warnings.push(...this.validateNote(p, text, previous));
+					for (const w of this.linkWarnings(text, p)) {
+						if (w.code !== "BROKEN_LINKS") warnings.push({ ...w, path: p });
+						else {
+							// Links to notes this same revert brings back are not broken.
+							const targets = (w.targets as string[]).filter((t) => !kept.has(targetNameOf(t)));
+							if (targets.length) warnings.push({ code: "BROKEN_LINKS", message: `Links to notes that do not exist: ${targets.join(", ")}.`, targets, path: p });
+						}
+					}
+				}
+
+				for (const p of removes) await rm(this.abs(p), { force: true });
+				for (const r of renames) {
+					await mkdir(dirname(this.abs(r.to)), { recursive: true });
+					await rename(this.abs(r.from), this.abs(r.to));
+				}
+				for (const [p, text] of writes) await this.writeText(p, raw.get(p) ?? text);
+				const paths = [...new Set([...touched, ...renames.map((r) => r.from)])];
+				const main = only ? (summary[0]?.path ?? only) : (summary.find((s) => /\.md$/i.test(s.path) && s.change !== "removed")?.path ?? summary[0]?.path ?? changes[0]?.path ?? "");
+				return { paths, result: { path: main, reverted: target, changes: summary }, warnings, contentPath: main, trailers: { Reverts: target } };
+			},
+		);
+	}
+
 	async attach(
 		client: ClientIdentity,
 		args: { path: string; source: { upload_id?: string; base64?: string }; name?: string; title?: string; description: string; aliases?: string[]; reason: string; confirm_new?: boolean },
@@ -1049,7 +1420,7 @@ export class MemoryService {
 		const upload = args.source.upload_id ? await uploads.get(args.source.upload_id) : await uploads.get((await uploads.fromBase64(args.source.base64 as string, fileName, client.id)).id);
 		const ext = (fileName.split(".").pop() as string).toLowerCase();
 		// Extraction runs before taking the write lock: it can be slow and touches only the upload.
-		const extraction: Extraction = ext === "pdf" ? await extractPdf(upload.file, { binary: this.opts.pdftotext }) : { method: "none", pages: [], reason: `no text extractor for .${ext} files` };
+		const extraction: Extraction = await extractAttachment(upload.file, ext, { pdftotext: this.opts.pdftotext, ocr: this.opts.ocr });
 		const result = await this.mutate(client, "attach", args.reason, async () => {
 			if (!this.lfs) throw new MemoryError("LFS_UNAVAILABLE", "git-lfs is not installed on the server.");
 			const dir = dirOf(binPath);
@@ -1088,13 +1459,20 @@ export class MemoryService {
 			}
 			const fm: Record<string, unknown> = { name: title, description: args.description.replace(/\s+/g, " ").trim(), aliases, attachment: fileName, extracted_with: extraction.method };
 			let body = `# ${title}\n\n![[${fileName}]]\n`;
-			for (const page of extraction.pages) body += `\n## ${this.conventions.attachments.pageHeading.replace("{n}", String(page.number))}\n\n${page.text}\n`;
+			if (extraction.ocr) body += `\n> ${this.conventions.attachments.ocrNotice.replace("{languages}", extraction.ocr.languages)}\n`;
+			if (extraction.image && extraction.pages.length === 1) body += `\n${extraction.pages[0]?.text}\n`;
+			else for (const page of extraction.pages) body += `\n## ${this.conventions.attachments.pageHeading.replace("{n}", String(page.number))}\n\n${page.text}\n`;
 			const content = `---\n${stringifyYaml(fm, { lineWidth: 0 }).trimEnd()}\n---\n${body}`;
 			this.validateNote(companion, content);
 			await this.writeText(companion, content);
 			const warnings: Warning[] = [];
 			if (extraction.method === "none") warnings.push({ code: "EXTRACTION_EMPTY", message: `No text was extracted: ${extraction.reason ?? "unknown reason"}.` });
-			return { paths, result: { path: companion, attachment: binPath, pages: extraction.pages.length }, warnings, contentPath: companion };
+			const { skippedPages = 0, failedPages = [] } = extraction.ocr ?? {};
+			if (skippedPages || failedPages.length) {
+				const parts = [skippedPages ? `the last ${skippedPages} of ${extraction.pageCount} pages were not OCR'd (page limit)` : "", failedPages.length ? `OCR failed on page(s) ${failedPages.join(", ")}` : ""].filter(Boolean);
+				warnings.push({ code: "EXTRACTION_PARTIAL", message: `Only part of the text was extracted: ${parts.join("; ")}.`, skipped_pages: skippedPages, failed_pages: failedPages });
+			}
+			return { paths, result: { path: companion, attachment: binPath, pages: extraction.pages.length, extracted_with: extraction.method }, warnings, contentPath: companion };
 		});
 		await uploads.remove(upload.meta.id).catch(() => undefined);
 		return result;

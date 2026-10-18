@@ -7,6 +7,7 @@ import type { ServerConfig } from "./config.js";
 import { privateApp, publicApp } from "./http.js";
 import { jsonLogger, type Logger } from "./log.js";
 import { MemoryService } from "./memory.js";
+import { detectOcr } from "./ocr.js";
 import { UploadStore } from "./uploads.js";
 
 export interface RunningServer {
@@ -29,6 +30,7 @@ function listen(app: ReturnType<typeof privateApp>, address: string, port: numbe
 export async function startServer(config: ServerConfig, log: Logger = jsonLogger(undefined, config.logLevel)): Promise<RunningServer> {
 	const uploads = new UploadStore(join(config.dataDir, "uploads"));
 	await uploads.init();
+	const ocr = await detectOcr(config.ocr, log);
 	const memory = new MemoryService({
 		repoDir: join(config.dataDir, "repo"),
 		indexPath: join(config.dataDir, "index.sqlite"),
@@ -37,8 +39,10 @@ export async function startServer(config: ServerConfig, log: Logger = jsonLogger
 		authorDomain: config.authorDomain,
 		uploads,
 		pdftotext: config.pdftotext,
+		ocr,
 		log,
 		fetchIntervalMs: config.fetchIntervalSeconds > 0 ? config.fetchIntervalSeconds * 1000 : undefined,
+		embeddings: config.embeddings,
 	});
 	await memory.start();
 	const tokens = new TokenStore(config.tokensFile);
@@ -80,6 +84,7 @@ export async function startServer(config: ServerConfig, log: Logger = jsonLogger
 		private: config.listen.private ? `${config.listen.private.address}:${config.listen.private.port}` : null,
 		tokens: tokens.count,
 		oauth: Boolean(oauth),
+		embeddings: config.embeddings ? config.embeddings.model : null,
 	});
 	return {
 		memory,

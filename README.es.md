@@ -11,8 +11,9 @@ Una memoria autoalojada para agentes de IA. Tus notas son una carpeta de Markdow
 - **Seguro con varios agentes a la vez.** Una sola cola de escritura, concurrencia optimista (el `hash` de `read`) y los pushes de fuera (tu PC, el editor web de Forgejo) se integran con rebase.
 - **Tus convenciones, no las nuestras.** El repo de notas declara sus carpetas, su frontmatter obligatorio y sus reglas de nombres en `memory.toml`; su `AGENTS.md` llega a todos los clientes como instrucciones MCP, junto con un índice corto.
 - **Dos puertas de entrada.** Un listener privado para tokens fijos por cliente, subida de archivos y el webhook de git. Un listener público que solo acepta tokens OAuth 2.1 (registro dinámico de clientes y PKCE, con el inicio de sesión delegado en Forgejo) para clientes remotos como claude.ai.
-- **Adjuntos.** Los binarios van a git LFS con una nota al lado que contiene su texto (los PDF, con `pdftotext`), así que también se encuentran al buscar.
+- **Adjuntos.** Los binarios van a git LFS con una nota al lado que contiene su texto (los PDF, con `pdftotext`; los PDF escaneados y las imágenes, con OCR local mediante `tesseract` si está instalado), así que también se encuentran al buscar.
 - **Enlaces con tipo.** `works_at:: [[acme]]` dice qué significa un enlace, y `links` puede filtrar por él.
+- **Búsqueda por significado, opcional.** Apunta `[embeddings]` a cualquier endpoint de embeddings compatible con OpenAI (Ollama o llama.cpp en la misma CPU, TEI, OpenAI…) y `search` combina el texto completo con la similitud de vectores, así que «coche» encuentra la nota que dice «vehículo». Dentro del servidor no corre ningún modelo y no hace falta GPU; sin él, la búsqueda es solo de texto completo.
 
 Cómo funciona por dentro (índice, flujo de escritura, concurrencia, autenticación): [docs/design.md](docs/design.md).
 
@@ -26,24 +27,31 @@ https://raw.githubusercontent.com/PabloPC05/my-memory/main/docs/agent-setup.md
 
 El agente lee [la guía de instalación](docs/agent-setup.md) y se instala tu memoria él solo en su plataforma: la encuentra entre sus herramientas, te propone importar lo que ya sabe de ti, instala sus instrucciones permanentes y, donde la plataforma lo permite (Claude Code, tus propios agentes), le impide guardar en cualquier otro sitio. Te pide un único permiso antes de cambiar nada. Inspirado en la página de instalación para agentes de Notion.
 
+En Claude Code también puede instalar, si quieres, un hook que le acerca al agente las notas relevantes sin que tenga que acordarse de buscar (como hace Supermemory): antes de cada mensaje, [`inject-memory.mjs`](docs/agent-setup/claude-code/inject-memory.mjs) busca ese mensaje en tu memoria y añade al turno las mejores coincidencias, presentadas como información que comprobar, no como instrucciones, y con un límite de tamaño pequeño. Necesita `MY_MEMORY_URL` y un `MY_MEMORY_TOKEN` de solo lectura, y no añade nada ante cualquier error o tiempo de espera agotado.
+
 ## Herramientas
 
 | Herramienta | Qué hace |
 |---|---|
 | `list` | Índice corto, o todas las notas de una carpeta con descripción, alias y último cambio |
-| `search` | Búsqueda de texto completo por secciones (sin distinguir acentos, los prefijos coinciden) con fragmentos |
+| `search` | Búsqueda de texto completo por secciones (sin distinguir acentos, los prefijos coinciden) con fragmentos; híbrida con búsqueda por significado si hay `[embeddings]` |
 | `read` | Una nota o una sección, con su `hash`; `revision` lee una versión antigua |
 | `links` | Enlaces `[[...]]` salientes (también los rotos) y retroenlaces con contexto, opcionalmente solo una relación |
 | `history` | Commits que tocaron una nota: quién, cuándo, por qué |
+| `recent` | Últimos cambios de toda la memoria: por commit cuándo, quién (autor y cliente), herramienta, motivo y las notas que tocó; filtros `since` (`2026-05-01` o `7d`), `folder`, `client` |
+| `lint` | Lista de mantenimiento, lo más grave primero: frontmatter roto y notas sustituidas fuera del archivo, enlaces rotos, posibles duplicados, deducciones antiguas, páginas que faltan, menciones sin enlace, notas huérfanas, sin tocar hace mucho o demasiado grandes. Cuenta por tipo; filtra por `kinds`, `folder` y `limit` |
 | `clients` | Quién está conectado: cada token y app OAuth con su última conexión (hora y herramienta), escrituras en los últimos 7 y 30 días y la versión de `memory-setup` que dejó anotada en las notas. Nunca devuelve secretos |
 | `create` | Nota nueva; nombres únicos entre carpetas; rechaza duplicados parecidos salvo `confirm_new` |
 | `edit` | Reemplazos de texto exactos, todos o ninguno |
 | `write` | Reescribe una nota entera; necesita el `hash` que leíste |
 | `move` | Renombra o mueve; reescribe todos los `[[enlaces]]` a ella en el mismo commit |
 | `delete` | Borra una nota (queda en el historial); se rechaza mientras otras notas la enlacen |
+| `revert` | Deshace un commit de `recent`/`history` con un commit nuevo, o solo lo que hizo en una nota; conserva los cambios posteriores que no se solapan y si no, se rechaza con `REVERT_CONFLICT` |
 | `attach` | Guarda un archivo en LFS con una nota al lado en la que se puede buscar |
 
-Los clientes con un token de solo lectura ven solo las cinco primeras y `clients`.
+Los clientes con un token de solo lectura ven solo las herramientas de lectura: `list`, `search`, `read`, `links`, `history`, `recent`, `lint` y `clients`.
+
+`lint` es la mitad barata de mantener la memoria en orden (la «wiki para LLM» de Karpathy: ingerir, responder, revisar). Sale del índice y de las fechas de git en milisegundos, sin modelo, así que el agente recibe candidatos en vez de leerse todas las notas; juzgarlos (¿es una contradicción?, ¿sigue valiendo esa deducción?, ¿fusionar o enlazar?) es la mitad del agente. Más en [docs/design.md](docs/design.md#lint).
 
 El servidor también ofrece la guía de instalación para agentes a todo cliente conectado, sin conexión (va dentro del paquete): como prompt MCP `setup` («Set up this memory on your host») y como recurso `memory://agent-setup`, ambos con el Markdown de [docs/agent-setup.md](docs/agent-setup.md). Las instrucciones del servidor los mencionan, así que un agente que se encuentre en una plataforma sin configurar puede seguirlos sin que le des la URL.
 
@@ -84,20 +92,32 @@ file = "AGENTS.md"
 
 [attachments]
 page_heading = "Page {n}"
+ocr_notice   = "Text recognised with OCR ({languages}); it may contain errors."
 
 [relations]
 allowed = ["works_at", "lives_with"]  # avisa con otras claves; sin esto, se sugieren las que estén en uso
+
+[lint]
+exclude            = []            # carpetas que no se revisan (la raíz y la carpeta de archivo nunca se revisan)
+orphan_exclude     = ["me"]        # nunca se avisan como huérfanas; por defecto, folders.index_full
+stale_days         = 180           # sin cambios más tiempo → stale
+inference_days     = 90            # «(deducido, 2026-01-31)» más antiguo → old_inference
+inferred_markers   = ["deducido"]  # palabras de procedencia que marcan una deducción
+max_bytes          = 16384         # más grande → oversized (las notas de adjuntos no cuentan)
+missing_page_min   = 2             # un destino que no existe enlazado desde tantas notas → missing_page
+mention_min_length = 4             # nombre o alias más corto que se busca como mención sin enlace
 ```
 
 ## Ponerlo en marcha
 
-Requisitos: Node.js 24, git, git-lfs y `pdftotext` de poppler (opcional).
+Requisitos: Node.js 24, git, git-lfs y, de forma opcional, poppler-utils (`pdftotext` para el texto de los PDF y `pdftoppm` para el OCR de escaneos) y `tesseract` con los idiomas que quieras (para el OCR de PDF escaneados e imágenes). Al arrancar se registra qué herramientas hay (`ocr.tools` en el log); si falta alguna, solo deja de estar disponible esa extracción.
 
 ```sh
 npm ci && npm run build
 my-memory token add laptop --name "Claude Code (laptop)" --scope write --file tokens.toml
 my-memory serve --config config.toml
 my-memory clients --config config.toml     # quién está conectado: última conexión, escrituras, versión de la guía (--json para scripts)
+my-memory lint --config config.toml        # lista de mantenimiento (--json, --kind stale,orphan, --folder, --limit)
 ```
 
 Las horas de última conexión se guardan en `activity.sqlite`, en el directorio de datos (como mucho una vez por minuto y cliente; no está en el repo de notas), y el número de escrituras sale de los trailers `Client:` del historial de git.
@@ -129,6 +149,23 @@ forgejo_internal_url = "http://127.0.0.1:3000"  # como lo ve el servidor
 client_id_file = "oauth-client-id"              # una app OAuth2 registrada en Forgejo,
 client_secret_file = "oauth-client-secret"      # URI de redirección <public_url>/oauth/callback
 allowed_users = ["me"]
+
+[ocr]                                           # todas las claves son opcionales
+enabled = true
+languages = "spa+eng"                           # códigos de idioma de tesseract; por defecto "eng"
+max_pages = 50                                  # páginas de un PDF escaneado que pasan por OCR
+page_timeout_seconds = 120                      # por página (render + reconocimiento) o imagen
+# dpi = 300; tesseract = "tesseract"; pdftoppm = "pdftoppm"
+
+[embeddings]                                    # opcional: búsqueda por significado; omítelo para solo texto completo
+url = "http://127.0.0.1:11434/v1/embeddings"    # cualquier endpoint compatible con OpenAI (Ollama, llama.cpp, TEI, OpenAI…)
+model = "nomic-embed-text"
+# api_key_file = "embeddings-key"               # se envía como token Bearer, si el endpoint lo pide
+# dimensions = 512                              # para modelos que pueden acortar su salida
+# batch_size = 32
+# timeout_seconds = 60
+query_prefix = "search_query: "                 # algunos modelos quieren marcadas sus entradas (nomic, e5)
+document_prefix = "search_document: "
 ```
 
 Subidas para `attach`: `curl -T file.pdf -H "Authorization: Bearer $TOKEN" http://host:8782/uploads/file.pdf` devuelve un `upload_id`. No hay límite de tamaño.
@@ -145,11 +182,24 @@ Subidas para `attach`: `curl -T file.pdf -H "Authorization: Bearer $TOKEN" http:
     remote = { url = "http://127.0.0.1:3000/me/notes.git"; tokenFile = "/run/secrets/forgejo-token"; };
     listen.private = { address = "127.0.0.1"; port = 8782; };
     tokensFile = "/var/lib/secrets/my-memory/tokens.toml";   # root:my-memory 0640
+    # ocr = { enable = true; languages = [ "spa" "eng" ]; maxPages = 50; pageTimeoutSeconds = 120; dpi = 300; };
   };
 }
 ```
 
-Tras `my-memory token add … --file <tokensFile>`, ejecuta `systemctl reload my-memory`.
+Tras `my-memory token add … --file <tokensFile>`, ejecuta `systemctl reload my-memory`. El paquete trae pdftotext, pdftoppm y tesseract; el módulo instala los datos de los idiomas de `ocr.languages` (por defecto español e inglés), y solo compila ese tesseract con `ocr.enable` activado.
+
+Para la búsqueda por significado, añade `embeddings = { url = "http://127.0.0.1:11434/v1/embeddings"; model = "nomic-embed-text"; queryPrefix = "search_query: "; documentPrefix = "search_document: "; };` (con `apiKeyFile` si el endpoint pide clave), por ejemplo junto a `services.ollama`.
+
+### Búsqueda por significado
+
+Con `[embeddings]`, cada sección de cada nota recibe un vector del endpoint, que se guarda en `index.sqlite`. Entonces `search` acepta `mode`: `hybrid` (por defecto) combina el ranking de texto completo y el de vectores con Reciprocal Rank Fusion, `text` es la búsqueda de texto completo de siempre y `semantic` usa solo los vectores. La respuesta tiene la misma forma de siempre.
+
+- **Las escrituras nunca lo esperan.** Las secciones se procesan en segundo plano después de cada commit o sincronización; mientras tanto se encuentran por texto. Solo se vuelven a procesar las secciones cuyo texto cambió, y cambiar `model`, `dimensions` o `document_prefix` las procesa todas otra vez.
+- **Si el endpoint está caído**, las escrituras funcionan como siempre, la búsqueda vuelve al texto completo con un aviso en el log y las secciones pendientes se reintentan con espera creciente.
+- **Estado en el log:** `embeddings.status` al arrancar (modelo, vectores, secciones pendientes), `embeddings.done` tras cada pasada y `embeddings.failed` mientras el endpoint falla.
+- `my-memory reindex` también procesa las secciones que falten; `--reembed` las procesa todas otra vez. Con una clave `credential:` que no puede leer fuera de systemd, se salta los embeddings y los hace el servicio al arrancar.
+- En un servidor pequeño sin GPU, Ollama con `nomic-embed-text` (multilingües: `bge-m3` o `multilingual-e5-small`, los e5 con los prefijos `query: ` y `passage: `) procesa unos miles de secciones en minutos, una sola vez.
 
 ### Conectar clientes
 

@@ -18,6 +18,9 @@ let
   cfg = config.services.my-memory;
   toml = pkgs.formats.toml { };
 
+  # Tesseract with just the language data the OCR config asks for. Only referenced (so only built) with OCR on.
+  ocrTesseract = pkgs.tesseract.override { enableLanguages = lib.unique cfg.ocr.languages; };
+
   listenType = types.submodule {
     options = {
       address = mkOption {
@@ -33,7 +36,10 @@ let
     optional (cfg.remote != null && cfg.remote.tokenFile != null) "remote-token:${cfg.remote.tokenFile}"
     ++ optional (cfg.webhookSecretFile != null) "webhook-secret:${cfg.webhookSecretFile}"
     ++ optional (cfg.oauth != null) "oauth-client-id:${cfg.oauth.clientIdFile}"
-    ++ optional (cfg.oauth != null) "oauth-client-secret:${cfg.oauth.clientSecretFile}";
+    ++ optional (cfg.oauth != null) "oauth-client-secret:${cfg.oauth.clientSecretFile}"
+    ++ optional (
+      cfg.embeddings != null && cfg.embeddings.apiKeyFile != null
+    ) "embeddings-api-key:${cfg.embeddings.apiKeyFile}";
 
   settings =
     {
@@ -43,6 +49,18 @@ let
       fetch_interval_seconds = cfg.fetchIntervalSeconds;
       log_level = cfg.logLevel;
       pdftotext = "${pkgs.poppler-utils}/bin/pdftotext";
+      ocr =
+        {
+          enabled = cfg.ocr.enable;
+        }
+        // optionalAttrs cfg.ocr.enable {
+          languages = lib.concatStringsSep "+" cfg.ocr.languages;
+          max_pages = cfg.ocr.maxPages;
+          page_timeout_seconds = cfg.ocr.pageTimeoutSeconds;
+          inherit (cfg.ocr) dpi;
+          tesseract = "${ocrTesseract}/bin/tesseract";
+          pdftoppm = "${pkgs.poppler-utils}/bin/pdftoppm";
+        };
       listen =
         optionalAttrs (cfg.listen.public != null) { public = cfg.listen.public; }
         // optionalAttrs (cfg.listen.private != null) { private = cfg.listen.private; };
@@ -67,6 +85,18 @@ let
         access_ttl_seconds = cfg.oauth.accessTtlSeconds;
         refresh_ttl_seconds = cfg.oauth.refreshTtlSeconds;
       };
+    }
+    // optionalAttrs (cfg.embeddings != null) {
+      embeddings =
+        {
+          inherit (cfg.embeddings) url model;
+          batch_size = cfg.embeddings.batchSize;
+          timeout_seconds = cfg.embeddings.timeoutSeconds;
+          query_prefix = cfg.embeddings.queryPrefix;
+          document_prefix = cfg.embeddings.documentPrefix;
+        }
+        // optionalAttrs (cfg.embeddings.dimensions != null) { inherit (cfg.embeddings) dimensions; }
+        // optionalAttrs (cfg.embeddings.apiKeyFile != null) { api_key_file = "credential:embeddings-api-key"; };
     };
 
   configFile = toml.generate "my-memory.toml" settings;
@@ -177,10 +207,100 @@ in
       );
     };
 
+    embeddings = mkOption {
+      default = null;
+      description = ''
+        Optional semantic search: an OpenAI-compatible embeddings endpoint (Ollama, llama.cpp server,
+        Hugging Face TEI, OpenAI…). Search then fuses full text with search by meaning; without it
+        search is full-text only.
+      '';
+      type = types.nullOr (
+        types.submodule {
+          options = {
+            url = mkOption {
+              type = types.str;
+              example = "http://127.0.0.1:11434/v1/embeddings";
+              description = "Full URL of the /v1/embeddings endpoint.";
+            };
+            model = mkOption {
+              type = types.str;
+              example = "nomic-embed-text";
+            };
+            apiKeyFile = mkOption {
+              type = types.nullOr types.str;
+              default = null;
+              description = "File with the API key (sent as a Bearer token), if the endpoint needs one.";
+            };
+            dimensions = mkOption {
+              type = types.nullOr types.ints.positive;
+              default = null;
+              description = "Output size to ask for, for models that support it (OpenAI text-embedding-3-*).";
+            };
+            batchSize = mkOption {
+              type = types.ints.positive;
+              default = 32;
+            };
+            timeoutSeconds = mkOption {
+              type = types.ints.positive;
+              default = 60;
+            };
+            queryPrefix = mkOption {
+              type = types.str;
+              default = "";
+              example = "search_query: ";
+              description = "Prepended to search queries (some models, like nomic-embed-text or e5, want it).";
+            };
+            documentPrefix = mkOption {
+              type = types.str;
+              default = "";
+              example = "search_document: ";
+              description = "Prepended to note sections.";
+            };
+          };
+        }
+      );
+    };
+
     fetchIntervalSeconds = mkOption {
       type = types.int;
       default = 300;
       description = "Safety-net fetch from the remote, in case a webhook is missed. 0 disables it.";
+    };
+
+    ocr = {
+      enable = mkOption {
+        type = types.bool;
+        default = true;
+        description = "OCR scanned PDFs (pdftoppm + tesseract) and images (tesseract) when they are attached.";
+      };
+      languages = mkOption {
+        type = types.listOf types.str;
+        default = [
+          "spa"
+          "eng"
+        ];
+        example = [
+          "spa"
+          "eng"
+          "fra"
+        ];
+        description = "Tesseract languages, in order of preference; their language data is installed for the service.";
+      };
+      maxPages = mkOption {
+        type = types.ints.positive;
+        default = 50;
+        description = "Pages of a scanned PDF that are OCR'd; the rest is left out with a warning.";
+      };
+      pageTimeoutSeconds = mkOption {
+        type = types.ints.positive;
+        default = 120;
+        description = "Time limit for rendering and recognising one page or image.";
+      };
+      dpi = mkOption {
+        type = types.ints.positive;
+        default = 300;
+        description = "Resolution at which scanned PDF pages are rendered for OCR.";
+      };
     };
 
     logLevel = mkOption {
@@ -203,6 +323,10 @@ in
       {
         assertion = cfg.listen.public == null || (cfg.oauth != null && cfg.publicUrl != null);
         message = "services.my-memory: the public listener needs oauth and publicUrl";
+      }
+      {
+        assertion = !cfg.ocr.enable || cfg.ocr.languages != [ ];
+        message = "services.my-memory: ocr.languages must name at least one language";
       }
     ];
 
