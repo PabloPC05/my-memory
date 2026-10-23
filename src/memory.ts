@@ -1,6 +1,4 @@
-import { existsSync } from "node:fs";
-import { copyFile, lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { copyFile, lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { stringify as stringifyYaml } from "yaml";
@@ -9,13 +7,15 @@ import { dot, EmbeddingClient, Embedder, type EmbeddingsConfig, reciprocalRankFu
 import { MemoryError } from "./errors.js";
 import { extractAttachment, type Extraction } from "./extract.js";
 import { parseNote, splitFrontmatter } from "./frontmatter.js";
-import { Git } from "./git.js";
+import type { Git } from "./git.js";
 import { type LintArgs, lint } from "./lint.js";
 import { type Logger, silentLogger } from "./log.js";
 import { firstH1, rewriteWikiLinks, splitSections, targetNameOf } from "./markdown.js";
 import type { OcrRunner } from "./ocr.js";
 import { parseTypedLinks } from "./relations.js";
 import { SETUP_GUIDE_URI, SETUP_GUIDE_URL } from "./setup-guide.js";
+import { type Author, EMPTY_TREE, type NoteStore, StoreConflictError } from "./store.js";
+import { GitStore } from "./store-git.js";
 import { buildFtsQuery, type NoteRow, type SearchHit, SearchIndex } from "./search-index.js";
 import type { UploadStore } from "./uploads.js";
 import {
@@ -32,7 +32,6 @@ import {
 	normalizeWords,
 	noteLabels,
 	noteName,
-	parseNameStatus,
 	parseSince,
 	sha256,
 	topFolder,
@@ -55,6 +54,7 @@ export interface RemoteConfig {
 }
 
 export interface MemoryOptions {
+	/** Where the git working clone lives (GitStore). Ignored when `store` is given. */
 	repoDir: string;
 	indexPath: string;
 	branch?: string;
@@ -72,6 +72,8 @@ export interface MemoryOptions {
 	/** Optional semantic search through an embeddings endpoint; without it search is full-text only. */
 	embeddings?: EmbeddingsConfig | null;
 	embeddingsRetry?: { initialMs: number; maxMs: number };
+	/** Where the notes live; by default a git working clone at `repoDir` (GitStore). */
+	store?: NoteStore;
 }
 
 export type SearchMode = "hybrid" | "text" | "semantic";
@@ -96,9 +98,6 @@ type NoteRef = { path?: string; name?: string };
 
 const READ_ONLY = new MemoryError("FORBIDDEN", "This client has read-only access.");
 
-/** git's empty tree: the "parent" of a root commit. */
-const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-
 /** One commit as `recent` returns it. */
 export interface RecentCommit {
 	commit: string;
@@ -119,14 +118,13 @@ const CHANGE_NAMES: Record<string, RecentCommit["notes"][number]["change"]> = { 
  * Reads go straight to the files and the index; every write goes through one queue and ends as one commit.
  */
 export class MemoryService {
-	readonly git: Git;
+	readonly store: NoteStore;
 	index!: SearchIndex;
 	conventions: Conventions = defaultConventions();
 	private conventionsHash = "";
 	private readonly lock = new Mutex();
 	private readonly log: Logger;
 	private readonly branch: string;
-	private lfs = false;
 	private pushPending = false;
 	private pushTimer: NodeJS.Timeout | null = null;
 	private pushDelay: number;
@@ -140,50 +138,26 @@ export class MemoryService {
 		this.log = opts.log ?? silentLogger;
 		this.branch = opts.branch ?? "main";
 		this.pushDelay = opts.pushRetry?.initialMs ?? 30_000;
-		const config: Record<string, string> = {};
-		if (opts.remote?.token) {
-			const basic = Buffer.from(`${opts.remote.username ?? "my-memory"}:${opts.remote.token}`).toString("base64");
-			config["http.extraHeader"] = `Authorization: Basic ${basic}`;
-		}
-		this.git = new Git(opts.repoDir, { config });
+		this.store =
+			opts.store ??
+			new GitStore({ repoDir: opts.repoDir, branch: this.branch, remote: opts.remote, committer: opts.committer ?? { name: "my-memory", email: `my-memory@${this.authorDomain()}` } });
 		if (opts.embeddings) this.embedder = new Embedder(new EmbeddingClient(opts.embeddings), () => this.index, this.log, opts.embeddingsRetry);
+	}
+
+	/** The git binary wrapper of a GitStore (the clients report reads the log with it). */
+	get git(): Git {
+		if (this.store instanceof GitStore) return this.store.git;
+		throw new MemoryError("INTERNAL", "This memory is not a local git clone.");
 	}
 
 	// ── lifecycle ────────────────────────────────────────────────────────────
 
 	async start(): Promise<void> {
-		await mkdir(dirname(this.opts.repoDir), { recursive: true });
 		await mkdir(dirname(this.opts.indexPath), { recursive: true });
-		if (!existsSync(join(this.opts.repoDir, ".git"))) {
-			if (this.opts.remote) {
-				const parent = new Git(dirname(this.opts.repoDir), { config: this.gitConfig() });
-				await parent.run(["clone", "-q", "--no-checkout", this.opts.remote.url, this.opts.repoDir]);
-				const branches = await this.git.out(["branch", "-r"]);
-				if (branches.includes(`origin/${this.branch}`)) await this.git.run(["checkout", "-q", "-B", this.branch, `origin/${this.branch}`]);
-				else await this.git.run(["symbolic-ref", "HEAD", `refs/heads/${this.branch}`]);
-			} else {
-				await mkdir(this.opts.repoDir, { recursive: true });
-				await this.git.run(["init", "-q", "-b", this.branch]);
-			}
-		}
-		const committer = this.opts.committer ?? { name: "my-memory", email: `my-memory@${this.authorDomain()}` };
-		for (const [k, v] of [
-			["core.autocrlf", "false"],
-			["core.quotepath", "false"],
-			["user.name", committer.name],
-			["user.email", committer.email],
-			["pull.rebase", "true"],
-		] as const) {
-			await this.git.run(["config", "--local", k, v]);
-		}
-		this.lfs = await this.git.lfsAvailable();
-		if (this.lfs) await this.git.run(["lfs", "install", "--local", "--skip-smudge"], { allowFail: true });
-
-		const head = await this.git.head();
-		if (!(await this.git.isClean())) {
-			const dirty = (await this.git.out(["status", "--porcelain", "--untracked-files=all"])).trim().split("\n");
-			this.log("warn", "worktree.dirty_at_start", { paths: dirty.map((l) => l.slice(3)) });
-			await this.restoreWorktree(head);
+		const { dirty } = await this.store.init();
+		if (dirty.length) {
+			this.log("warn", "worktree.dirty_at_start", { paths: dirty });
+			await this.restoreWorktree(await this.store.head());
 		}
 		await this.loadConventions();
 		this.index = new SearchIndex(this.opts.indexPath);
@@ -193,10 +167,10 @@ export class MemoryService {
 			this.log("info", "embeddings.status", this.embedder.status());
 			this.embedder.schedule();
 		}
-		if (this.opts.remote) {
+		if (this.store.hasRemote) {
 			await this.lock.run(() => this.syncLocked("startup")).catch((error) => this.log("warn", "sync.startup_failed", { error: String(error) }));
 		}
-		if (this.opts.fetchIntervalMs && this.opts.remote) {
+		if (this.opts.fetchIntervalMs && this.store.hasRemote) {
 			this.fetchTimer = setInterval(() => this.requestSync("timer"), this.opts.fetchIntervalMs);
 			this.fetchTimer.unref();
 		}
@@ -225,12 +199,6 @@ export class MemoryService {
 		return this.lock.run(async () => undefined);
 	}
 
-	private gitConfig(): Record<string, string> {
-		if (!this.opts.remote?.token) return {};
-		const basic = Buffer.from(`${this.opts.remote.username ?? "my-memory"}:${this.opts.remote.token}`).toString("base64");
-		return { "http.extraHeader": `Authorization: Basic ${basic}` };
-	}
-
 	private authorDomain(): string {
 		return this.opts.authorDomain ?? "my-memory.invalid";
 	}
@@ -238,7 +206,7 @@ export class MemoryService {
 	// ── conventions and index ───────────────────────────────────────────────
 
 	private async loadConventions(): Promise<void> {
-		const file = join(this.opts.repoDir, CONVENTIONS_FILE);
+		const file = join(this.store.worktree, CONVENTIONS_FILE);
 		let text = "";
 		try {
 			text = await readFile(file, "utf8");
@@ -263,7 +231,7 @@ export class MemoryService {
 	/** Reads and parses a file for the index. Async part only: the index itself is then updated synchronously. */
 	private async prepareFile(path: string): Promise<() => void> {
 		if (!path.toLowerCase().endsWith(".md")) return this.isRootFile(path) ? () => undefined : () => this.index.putAsset(path);
-		const content = await readFile(join(this.opts.repoDir, path), "utf8");
+		const content = await readFile(this.abs(path), "utf8");
 		const parsed = parseNote(content, this.conventions);
 		const name = noteName(path);
 		const folder = topFolder(path);
@@ -295,30 +263,10 @@ export class MemoryService {
 		return () => this.index.putNote(record, sections, links);
 	}
 
-	/** Commit dates and authors per path, newest first, for the given log range. */
-	private async commitDates(range: string[], paths?: string[]): Promise<Map<string, { updatedAt: string; updatedBy: string; createdAt: string; createdBy: string }>> {
-		const out = await this.git.out(["log", "--no-renames", "--format=%x1e%aI%x1f%an", "--name-only", ...range, ...(paths ? ["--", ...paths] : [])]);
-		const dates = new Map<string, { updatedAt: string; updatedBy: string; createdAt: string; createdBy: string }>();
-		for (const block of out.split("\x1e")) {
-			if (!block.trim()) continue;
-			const [header, ...files] = block.split("\n");
-			const [at, by] = (header ?? "").split("\x1f") as [string, string];
-			for (const f of files) {
-				if (!f) continue;
-				const d = dates.get(f);
-				if (d) {
-					d.createdAt = at;
-					d.createdBy = by;
-				} else dates.set(f, { updatedAt: at, updatedBy: by, createdAt: at, createdBy: by });
-			}
-		}
-		return dates;
-	}
-
 	private async fullReindex(head: string | null): Promise<void> {
 		const started = Date.now();
-		const files = head ? (await this.git.out(["ls-files", "-z"])).split("\0").filter(Boolean) : [];
-		const dates = head ? await this.commitDates([head]) : new Map();
+		const files = head ? await this.store.listFiles() : [];
+		const dates = head ? await this.store.commitDates({ to: head }) : new Map();
 		const prepared = await Promise.all(files.map((f) => this.prepareFile(f)));
 		this.index.db.exec("BEGIN IMMEDIATE");
 		try {
@@ -342,18 +290,15 @@ export class MemoryService {
 
 	private async incrementalReindex(from: string, to: string): Promise<void> {
 		const started = Date.now();
-		const diff = await this.git.out(["diff", "--no-renames", "--name-status", "-z", from, to]);
-		const parts = diff.split("\0").filter(Boolean);
-		const changed: { status: string; path: string }[] = [];
-		for (let i = 0; i + 1 < parts.length; i += 2) changed.push({ status: parts[i] as string, path: parts[i + 1] as string });
+		const changed = await this.store.changedFiles(from, to);
 		if (changed.some((c) => c.path === CONVENTIONS_FILE)) {
 			await this.loadConventions();
 			if (this.conventionsHash !== (this.index.getMeta("conventions_hash") ?? "")) return this.fullReindex(to);
 		}
 		const present = changed.filter((c) => !c.status.startsWith("D")).map((c) => c.path);
-		const dates = present.length ? await this.commitDates([`${from}..${to}`], present) : new Map();
+		const dates = present.length ? await this.store.commitDates({ from, to }, present) : new Map();
 		for (const p of present) if (!dates.has(p) && p.toLowerCase().endsWith(".md")) {
-			const one = await this.commitDates(["-1", to], [p]);
+			const one = await this.store.commitDates({ to, latestOnly: true }, [p]);
 			const d = one.get(p);
 			if (d) dates.set(p, d);
 		}
@@ -387,11 +332,11 @@ export class MemoryService {
 
 	/** Brings the index to HEAD: nothing, incremental, or a full rebuild if it cannot tell what changed. */
 	private async reconcileIndex(): Promise<void> {
-		const head = await this.git.head();
+		const head = await this.store.head();
 		const indexed = this.index.getMeta("indexed_commit");
 		const sameConventions = (this.index.getMeta("conventions_hash") ?? "") === this.conventionsHash;
 		if (indexed !== null && indexed === (head ?? "") && sameConventions) return;
-		if (head && indexed && sameConventions && (await this.git.exists(indexed))) return this.incrementalReindex(indexed, head);
+		if (head && indexed && sameConventions && (await this.store.hasCommit(indexed))) return this.incrementalReindex(indexed, head);
 		return this.fullReindex(head);
 	}
 
@@ -400,16 +345,14 @@ export class MemoryService {
 		await this.lock.run(async () => {
 			await this.loadConventions();
 			if (opts.reembed) this.index.clearVectors();
-			await this.fullReindex(await this.git.head());
+			await this.fullReindex(await this.store.head());
 		});
 	}
 
 	// ── git sync ─────────────────────────────────────────────────────────────
 
-	private async restoreWorktree(head: string | null): Promise<void> {
-		if (head) await this.git.run(["reset", "-q", "--hard", head]);
-		else await this.git.run(["read-tree", "--empty"], { allowFail: true });
-		await this.git.run(["clean", "-fdq"]);
+	private restoreWorktree(head: string | null): Promise<void> {
+		return this.store.restore(head);
 	}
 
 	/**
@@ -417,69 +360,65 @@ export class MemoryService {
 	 * On a rebase conflict the remote wins: local commits are dropped (and logged) and the index follows.
 	 */
 	private async integrateRemoteLocked(): Promise<{ status: "ok" | "unreachable" } | { status: "conflict"; lost: string[] }> {
-		const fetched = await this.git.run(["fetch", "-q", "origin", this.branch], { allowFail: true });
-		if (fetched.code !== 0) {
-			if (/couldn't find remote ref|could not find remote ref/i.test(fetched.stderr)) return { status: "ok" }; // empty remote
-			this.log("warn", "git.fetch_failed", { error: fetched.stderr.trim().split("\n").pop() });
+		const fetched = await this.store.fetch();
+		if (fetched.status === "empty") return { status: "ok" }; // empty remote
+		if (fetched.status === "unreachable") {
+			this.log("warn", "git.fetch_failed", { error: fetched.error });
 			return { status: "unreachable" };
 		}
-		const remote = (await this.git.run(["rev-parse", "--verify", "-q", `origin/${this.branch}`], { allowFail: true })).stdout.trim();
-		const local = await this.git.head();
+		const remote = await this.store.remoteHead();
+		const local = await this.store.head();
 		if (!remote || remote === local) return { status: "ok" };
 		if (!local) {
-			await this.git.run(["reset", "-q", "--hard", remote]);
+			await this.store.moveTo(remote, { hard: true });
 			await this.reconcileAfterMove(null);
 			return { status: "ok" };
 		}
-		const isAncestor = async (a: string, b: string) => (await this.git.run(["merge-base", "--is-ancestor", a, b], { allowFail: true })).code === 0;
-		if (await isAncestor(remote, local)) return { status: "ok" }; // we are only ahead
-		if (await isAncestor(local, remote)) {
-			await this.git.run(["merge", "-q", "--ff-only", remote]);
+		if (await this.store.isAncestor(remote, local)) return { status: "ok" }; // we are only ahead
+		if (await this.store.isAncestor(local, remote)) {
+			await this.store.moveTo(remote);
 			await this.reconcileAfterMove(local);
 			this.log("info", "git.fast_forward", { from: local, to: remote });
 			return { status: "ok" };
 		}
-		const rebased = await this.git.run(["rebase", "-q", remote], { allowFail: true });
-		if (rebased.code === 0) {
+		if (await this.store.rebase(remote)) {
 			await this.reconcileAfterMove(local);
 			this.log("info", "git.rebased", { onto: remote });
 			return { status: "ok" };
 		}
-		await this.git.run(["rebase", "--abort"], { allowFail: true });
-		const lost = (await this.git.out(["log", "--format=%H %s", `${remote}..${local}`])).trim().split("\n").filter(Boolean);
-		await this.git.run(["reset", "-q", "--hard", remote]);
-		await this.git.run(["clean", "-fdq"]);
+		const lost = await this.store.commitsBetween(remote, local);
+		await this.store.moveTo(remote, { hard: true });
 		await this.reconcileAfterMove(local);
 		this.log("error", "git.remote_conflict", { dropped: lost.map((l) => l.split(" ")[0]) });
 		return { status: "conflict", lost };
 	}
 
 	private async reconcileAfterMove(previous: string | null): Promise<void> {
-		const head = await this.git.head();
+		const head = await this.store.head();
 		const before = this.conventionsHash;
 		await this.loadConventions();
-		if (!head || !previous || before !== this.conventionsHash || !(await this.git.exists(previous))) return this.fullReindex(head);
+		if (!head || !previous || before !== this.conventionsHash || !(await this.store.hasCommit(previous))) return this.fullReindex(head);
 		return this.incrementalReindex(previous, head);
 	}
 
 	/** Pushes, integrating the remote first when the push is rejected. */
 	private async pushLocked(): Promise<{ status: "ok" | "pending" } | { status: "conflict"; lost: string[] }> {
-		if (!this.opts.remote) return { status: "ok" };
+		if (!this.store.hasRemote) return { status: "ok" };
 		for (let attempt = 0; attempt < 3; attempt++) {
-			const r = await this.git.run(["push", "-q", "origin", `HEAD:refs/heads/${this.branch}`], { allowFail: true });
-			if (r.code === 0) {
+			const r = await this.store.push();
+			if (r.status === "ok") {
 				if (this.pushPending) this.log("info", "git.push_recovered", {});
 				this.pushPending = false;
 				this.pushDelay = this.opts.pushRetry?.initialMs ?? 30_000;
 				return { status: "ok" };
 			}
-			if (/\[rejected\]|non-fast-forward|fetch first|stale info|\[remote rejected\]/.test(r.stderr) && !/remote rejected.*(denied|protected|permission)/i.test(r.stderr)) {
+			if (r.status === "rejected") {
 				const integrated = await this.integrateRemoteLocked();
 				if (integrated.status === "conflict") return integrated;
 				if (integrated.status === "unreachable") break;
 				continue;
 			}
-			this.log("warn", "git.push_failed", { error: r.stderr.trim().split("\n").pop() });
+			this.log("warn", "git.push_failed", { error: r.error });
 			break;
 		}
 		this.pushPending = true;
@@ -504,11 +443,11 @@ export class MemoryService {
 
 	private async syncLocked(source: string): Promise<void> {
 		this.syncRequested = false;
-		if (!this.opts.remote) return;
+		if (!this.store.hasRemote) return;
 		const r = await this.integrateRemoteLocked();
 		if (r.status === "conflict") return;
-		const head = await this.git.head();
-		const remote = (await this.git.run(["rev-parse", "--verify", "-q", `origin/${this.branch}`], { allowFail: true })).stdout.trim();
+		const head = await this.store.head();
+		const remote = await this.store.remoteHead();
 		if (head && head !== remote && r.status === "ok") await this.pushLocked();
 		this.log("debug", "sync.done", { source });
 	}
@@ -516,7 +455,7 @@ export class MemoryService {
 	// ── helpers ──────────────────────────────────────────────────────────────
 
 	private abs(path: string): string {
-		return join(this.opts.repoDir, ...path.split("/"));
+		return join(this.store.worktree, ...path.split("/"));
 	}
 
 	private async exists(path: string): Promise<boolean> {
@@ -667,9 +606,9 @@ export class MemoryService {
 		return `${reason}\n\n${trailers.join("\n")}\n`;
 	}
 
-	private authorEnv(client: ClientIdentity): Record<string, string> {
+	private author(client: ClientIdentity): Author {
 		const local = client.id.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "client";
-		return { GIT_AUTHOR_NAME: client.name, GIT_AUTHOR_EMAIL: `${local}@${this.authorDomain()}` };
+		return { name: client.name, email: `${local}@${this.authorDomain()}` };
 	}
 
 	/**
@@ -691,42 +630,52 @@ export class MemoryService {
 		}
 		return this.lock.run(async () => {
 			if (this.syncRequested) await this.syncLocked("before-write");
-			const before = await this.git.head();
+			const before = await this.store.head();
 			let applied: Awaited<ReturnType<typeof apply>>;
+			let commit: string;
+			let touched: string | null = null;
 			try {
 				applied = await apply();
+				touched = applied.contentPath ?? applied.result.path;
 				const paths = [...new Set(applied.paths)];
-				await this.git.run(["add", "-A", "--", ...paths]);
-				const staged = await this.git.run(["diff", "--cached", "--quiet"], { allowFail: true });
-				if (staged.code === 0) {
+				const made = await this.store.commit(paths, this.commitMessage(client, tool, reason, applied.trailers), this.author(client));
+				if (made === null) {
 					const contentPath = applied.contentPath ?? applied.result.path;
 					const hash = (await this.exists(contentPath)) ? blobHash(await this.readText(contentPath)) : null;
 					return { commit: before, hash, ...applied.result, warnings: [...(applied.warnings ?? []), { code: "NO_CHANGES" as const, message: "Nothing changed; no commit was made." }] };
 				}
-				await this.git.run(["commit", "-q", "--no-verify", "-F", "-"], { input: this.commitMessage(client, tool, reason, applied.trailers), env: this.authorEnv(client) });
+				commit = made;
 			} catch (error) {
 				await this.restoreWorktree(before).catch((e) => this.log("error", "worktree.restore_failed", { error: String(e) }));
+				if (error instanceof StoreConflictError) {
+					// A store that publishes as it commits found the same files changed on the remote: the remote wins.
+					await this.integrateRemoteLocked().catch((e) => this.log("error", "git.integrate_failed", { error: String(e) }));
+					this.log("error", "git.remote_conflict", { dropped: error.lost });
+					throw await this.remoteConflict(touched);
+				}
 				throw error;
 			}
-			const commit = (await this.git.head()) as string;
 			if (before) await this.incrementalReindex(before, commit);
 			else await this.fullReindex(commit);
 			const warnings = [...(applied.warnings ?? [])];
 			const pushed = await this.pushLocked();
 			const contentPath = applied.contentPath ?? applied.result.path;
-			if (pushed.status === "conflict") {
-				const current = (await this.exists(contentPath)) ? await this.readText(contentPath) : null;
-				throw new MemoryError("REMOTE_CONFLICT", "Someone changed the memory at the same time and the changes collided; yours was not kept. Read the note again and redo the change.", {
-					path: contentPath,
-					hash: current === null ? null : blobHash(current),
-					content: current,
-				});
-			}
+			if (pushed.status === "conflict") throw await this.remoteConflict(contentPath);
 			if (pushed.status === "pending") warnings.push({ code: "PUSH_PENDING", message: "Saved and committed here, but the remote is unreachable; it will be pushed automatically." });
 			const hash = (await this.exists(contentPath)) && contentPath.endsWith(".md") ? blobHash(await this.readText(contentPath)) : null;
-			const finalCommit = (await this.git.head()) as string;
+			const finalCommit = (await this.store.head()) as string;
 			this.log("info", "memory.write", { client: client.id, tool, path: applied.result.path, commit: finalCommit.slice(0, 12), warnings: warnings.map((w) => w.code) });
 			return { commit: finalCommit, hash, ...applied.result, warnings };
+		});
+	}
+
+	/** The error for a write the remote overrode, with the note as it is now so the client can redo its change. */
+	private async remoteConflict(contentPath: string | null): Promise<MemoryError> {
+		const current = contentPath && (await this.exists(contentPath)) ? await this.readText(contentPath) : null;
+		return new MemoryError("REMOTE_CONFLICT", "Someone changed the memory at the same time and the changes collided; yours was not kept. Read the note again and redo the change.", {
+			path: contentPath,
+			hash: current === null ? null : blobHash(current),
+			content: current,
 		});
 	}
 
@@ -888,11 +837,11 @@ export class MemoryService {
 		let row: NoteRow | null = null;
 		if (args.revision) {
 			const rev = args.revision.trim();
-			if (!/^[\w./~^@{}-]+$/.test(rev) || rev.startsWith("-") || !(await this.git.exists(rev))) throw new MemoryError("INVALID_REVISION", `Unknown revision «${args.revision}».`);
+			if (!/^[\w./~^@{}-]+$/.test(rev) || rev.startsWith("-") || !(await this.store.hasCommit(rev))) throw new MemoryError("INVALID_REVISION", `Unknown revision «${args.revision}».`);
 			path = args.path ? checkPath(args.path, this.conventions, "note") : this.resolveNote(args).path;
-			const shown = await this.git.run(["show", `${rev}:${path}`], { allowFail: true });
-			if (shown.code !== 0) throw new MemoryError("NOT_FOUND", `«${path}» does not exist at ${rev}.`);
-			content = shown.stdout;
+			const shown = await this.store.show(rev, path);
+			if (shown === null) throw new MemoryError("NOT_FOUND", `«${path}» does not exist at ${rev}.`);
+			content = shown;
 		} else {
 			row = this.resolveNote(args);
 			path = row.path;
@@ -966,19 +915,7 @@ export class MemoryService {
 			path = checkPath(args.path, this.conventions, "note");
 		} else path = this.resolveNote(args).path;
 		const limit = Math.min(Math.max(args.limit ?? 20, 1), 200);
-		const out = await this.git.out(["log", "--follow", `-n${limit}`, "--format=%x1e%H%x1f%aI%x1f%an%x1f%ae%x1f%s%x1f%(trailers:only=true,unfold=true)", "--", path]);
-		const commits = out
-			.split("\x1e")
-			.filter((b) => b.trim())
-			.map((b) => {
-				const [commit, date, author, email, message, trailerText] = b.split("\x1f") as string[];
-				const trailers: Record<string, string> = {};
-				for (const line of (trailerText ?? "").split("\n")) {
-					const m = /^([\w-]+):\s*(.*)$/.exec(line.trim());
-					if (m) trailers[m[1] as string] = m[2] as string;
-				}
-				return { commit, date, author, email, message, trailers };
-			});
+		const commits = (await this.store.fileLog(path, limit)).map(({ commit, date, author, email, message, trailers }) => ({ commit, date, author, email, message, trailers }));
 		if (commits.length === 0) throw new MemoryError("NOT_FOUND", `No history for «${path}».`);
 		return { path, commits };
 	}
@@ -998,32 +935,16 @@ export class MemoryService {
 		const includeArchive = args.include_archive ?? (folder !== null && folder === archive);
 		const hidden = (p: string) => !includeArchive && archive !== null && topFolder(p) === archive;
 		const client = args.client?.trim().toLowerCase() || null;
-		if (!(await this.git.head())) return { commits: [] };
+		if (!(await this.store.head())) return { commits: [] };
 		const commits: RecentCommit[] = [];
 		// Filters that drop commits after git has listed them read the log in pages.
 		const page = client || since || !includeArchive ? Math.max(limit * 4, 100) : limit;
 		for (let skip = 0; commits.length < limit; skip += page) {
-			const out = await this.git.out([
-				"log",
-				`-n${page}`,
-				`--skip=${skip}`,
-				"-M",
-				"--name-status",
-				"--format=%x1e%H%x1f%aI%x1f%an%x1f%s%x1f%(trailers:only=true,unfold=true)%x1f",
-				...(since ? [`--since=${since}`] : []),
-				...(folder ? ["--full-diff", "--", `${folder}/`] : []),
-			]);
-			const blocks = out.split("\x1e").filter((b) => b.trim());
-			for (const block of blocks) {
-				const [commit, date, author, reason, trailerText, files] = block.split("\x1f") as string[];
-				const trailers: Record<string, string> = {};
-				for (const line of (trailerText ?? "").split("\n")) {
-					const m = /^([\w-]+):\s*(.*)$/.exec(line.trim());
-					if (m) trailers[m[1] as string] = m[2] as string;
-				}
+			const blocks = await this.store.log({ limit: page, skip, since, folder });
+			for (const { commit, date, author, message: reason, trailers, files } of blocks) {
 				if (client && trailers.Client?.toLowerCase() !== client && author?.toLowerCase() !== client) continue;
 				if (since && Date.parse(date as string) < Date.parse(since)) continue; // git's --since is a hint, not exact
-				const changes = parseNameStatus(files ?? "");
+				const changes = files ?? [];
 				const visible = changes.filter((c) => !hidden(c.path) || (c.from !== undefined && !hidden(c.from)));
 				if (changes.length > 0 && visible.length === 0) continue;
 				commits.push({
@@ -1211,39 +1132,12 @@ export class MemoryService {
 	private async branchCommit(input: unknown): Promise<string> {
 		const rev = typeof input === "string" ? input.trim() : "";
 		if (!rev) throw new MemoryError("INVALID_ARGUMENT", "«commit» is required: a hash from `recent` or `history`.");
-		if (!/^[\w./~^@{}-]+$/.test(rev) || rev.startsWith("-") || !(await this.git.exists(rev))) throw new MemoryError("INVALID_REVISION", `Unknown commit «${rev}».`);
-		const full = (await this.git.out(["rev-parse", "--verify", `${rev}^{commit}`])).trim();
-		const onBranch = (await this.git.run(["merge-base", "--is-ancestor", full, "HEAD"], { allowFail: true })).code === 0;
+		const full = /^[\w./~^@{}-]+$/.test(rev) && !rev.startsWith("-") ? await this.store.resolveCommit(rev) : null;
+		if (!full) throw new MemoryError("INVALID_REVISION", `Unknown commit «${rev}».`);
+		const head = await this.store.head();
+		const onBranch = head !== null && (full === head || (await this.store.isAncestor(full, head)));
 		if (!onBranch) throw new MemoryError("INVALID_REVISION", `Commit «${rev}» is not part of the memory's history (branch ${this.branch}).`);
 		return full;
-	}
-
-	/** Blob id of a file at a revision, or null when it does not exist there. */
-	private async blobAt(rev: string, path: string): Promise<string | null> {
-		const r = await this.git.run(["rev-parse", "-q", "--verify", `${rev}:${path}`], { allowFail: true });
-		return r.code === 0 ? r.stdout.trim() : null;
-	}
-
-	private async blobText(id: string): Promise<string> {
-		return this.git.out(["cat-file", "blob", id]);
-	}
-
-	/** A blob as raw bytes, for files copied from history unchanged (no round trip through UTF-8). */
-	private async blobBytes(id: string): Promise<Buffer> {
-		return this.git.bytes(["cat-file", "blob", id]);
-	}
-
-	/** Three-way merge of text (`git merge-file`): the result, or null when the changes overlap. */
-	private async mergeText(ours: string, base: string, theirs: string): Promise<string | null> {
-		const dir = await mkdtemp(join(tmpdir(), "mm-merge-"));
-		try {
-			const files = ["ours", "base", "theirs"].map((f) => join(dir, f));
-			await Promise.all([ours, base, theirs].map((text, i) => writeFile(files[i] as string, text, "utf8")));
-			const r = await this.git.run(["merge-file", "-p", "-q", ...files], { allowFail: true });
-			return r.code === 0 ? r.stdout : null;
-		} finally {
-			await rm(dir, { recursive: true, force: true });
-		}
 	}
 
 	/**
@@ -1260,10 +1154,11 @@ export class MemoryService {
 			async () => {
 				const target = await this.branchCommit(args.commit);
 				const short = target.slice(0, 12);
-				const parents = (await this.git.out(["rev-list", "--parents", "-n1", target])).trim().split(" ").slice(1);
+				const headNow = (await this.store.head()) as string;
+				const parents = await this.store.parents(target);
 				if (parents.length > 1) throw new MemoryError("INVALID_REVISION", `«${short}» is a merge commit; revert the commits it brought in instead.`);
 				const base = parents[0] ?? EMPTY_TREE;
-				let changes: FileChange[] = parseNameStatus(await this.git.out(["diff", "-M", "--name-status", base, target])).filter((c) => c.path !== ".gitattributes" && c.from !== ".gitattributes");
+				let changes: FileChange[] = (await this.store.diff(base, target)).filter((c) => c.path !== ".gitattributes" && c.from !== ".gitattributes");
 				let only: string | null = null;
 				if ((args.path ?? "").trim() || (args.name ?? "").trim()) {
 					if ((args.path ?? "").trim() && (args.name ?? "").trim()) throw new MemoryError("INVALID_ARGUMENT", "Give either «path» or «name», not both.");
@@ -1281,7 +1176,7 @@ export class MemoryService {
 				const notRestorable = (p: string) =>
 					new MemoryError("NOT_RESTORABLE", `«${p}» is a binary attachment; revert cannot bring its old content back. Attach the file again${only ? "" : ", or revert only the note with «path»"}.`, { path: p });
 				const conflict = async (p: string, why: string) => {
-					const later = (await this.git.out(["log", "--format=%H %s", `${target}..HEAD`, "--", p])).trim().split("\n").filter(Boolean);
+					const later = await this.store.commitsTouching(target, p);
 					return new MemoryError("REVERT_CONFLICT", `«${p}» ${why} since ${short}; nothing was reverted. Change it by hand instead.`, {
 						path: p,
 						later_commits: later.map((l) => ({ commit: l.slice(0, 40), message: l.slice(41) })),
@@ -1290,7 +1185,7 @@ export class MemoryService {
 				let renamedLater: FileChange[] | null = null;
 				/** Whether a path was moved (renamed) by a later commit, as opposed to deleted. */
 				const movedSince = async (p: string) => {
-					renamedLater ??= parseNameStatus(await this.git.out(["log", "-M", "--diff-filter=R", "--name-status", "--format=", `${target}..HEAD`]));
+					renamedLater ??= await this.store.renamesSince(target);
 					return renamedLater.some((r) => r.from === p);
 				};
 				const writes = new Map<string, string>(); // text, for the checks below
@@ -1298,12 +1193,12 @@ export class MemoryService {
 				/** Old text back on top of the current one, keeping later changes that do not overlap. */
 				const restoreText = async (dest: string, p: string, now: string, was: string, old: string) => {
 					if (now === was) {
-						const bytes = await this.blobBytes(old);
+						const bytes = await this.store.blobBytes(old);
 						raw.set(dest, bytes);
 						writes.set(dest, bytes.toString("utf8"));
 						return;
 					}
-					const merged = await this.mergeText(await this.blobText(now), await this.blobText(was), await this.blobText(old));
+					const merged = await this.store.mergeText(await this.store.blobText(now), await this.store.blobText(was), await this.store.blobText(old));
 					if (merged === null) throw await conflict(p, "was changed again where this commit changed it");
 					writes.set(dest, merged);
 				};
@@ -1313,8 +1208,8 @@ export class MemoryService {
 				const created = new Set<string>(); // paths that do not exist now and the revert brings back
 				const summary: { path: string; change: "restored" | "removed" | "reverted" | "moved_back"; from?: string }[] = [];
 				for (const c of changes) {
-					const now = await this.blobAt("HEAD", c.path);
-					const was = await this.blobAt(target, c.path);
+					const now = await this.store.blobAt(headNow, c.path);
+					const was = await this.store.blobAt(target, c.path);
 					if (c.status === "A" || c.status === "C") {
 						if (now === null) {
 							if (await movedSince(c.path)) throw await conflict(c.path, "was moved");
@@ -1324,7 +1219,7 @@ export class MemoryService {
 						removes.add(c.path);
 						summary.push({ path: c.path, change: "removed" });
 					} else if (c.status === "D") {
-						const old = (await this.blobAt(base, c.path)) as string;
+						const old = (await this.store.blobAt(base, c.path)) as string;
 						if (now === old) continue; // already back
 						if (now !== null) throw await conflict(c.path, "was created again");
 						if (!isText(c.path)) throw notRestorable(c.path);
@@ -1332,8 +1227,8 @@ export class MemoryService {
 						created.add(c.path);
 						summary.push({ path: c.path, change: "restored" });
 					} else if (c.status === "R" && c.from) {
-						const old = (await this.blobAt(base, c.from)) as string;
-						const nowOld = await this.blobAt("HEAD", c.from);
+						const old = (await this.store.blobAt(base, c.from)) as string;
+						const nowOld = await this.store.blobAt(headNow, c.from);
 						if (now === null && nowOld === old) continue; // already moved back
 						if (now === null) throw await conflict(c.path, "was moved or deleted");
 						if (nowOld !== null) throw await conflict(c.from, "was created again");
@@ -1344,7 +1239,7 @@ export class MemoryService {
 						created.add(c.from);
 						summary.push({ path: c.from, change: "moved_back", from: c.path });
 					} else {
-						const old = await this.blobAt(base, c.path);
+						const old = await this.store.blobAt(base, c.path);
 						if (now === old) continue; // already as it was
 						if (now === null || old === null) throw await conflict(c.path, "was deleted");
 						if (!isText(c.path)) throw notRestorable(c.path);
@@ -1422,7 +1317,7 @@ export class MemoryService {
 		// Extraction runs before taking the write lock: it can be slow and touches only the upload.
 		const extraction: Extraction = await extractAttachment(upload.file, ext, { pdftotext: this.opts.pdftotext, ocr: this.opts.ocr });
 		const result = await this.mutate(client, "attach", args.reason, async () => {
-			if (!this.lfs) throw new MemoryError("LFS_UNAVAILABLE", "git-lfs is not installed on the server.");
+			if (!this.store.supportsAttachments) throw new MemoryError("LFS_UNAVAILABLE", "This memory cannot keep binary attachments (git-lfs is not installed on the server, or the notes live on GitHub through its API).");
 			const dir = dirOf(binPath);
 			const companionName = (args.name ?? fileName.replace(/\.[^.]+$/, "")).replace(/\.md$/i, "");
 			const companion = joinPath(dir, `${companionName}.md`);
@@ -1445,8 +1340,8 @@ export class MemoryService {
 			}
 			// LFS rule for this extension, in the same commit.
 			const paths = [binPath, companion];
-			const attr = await this.git.out(["check-attr", "filter", "--", binPath]);
-			if (!/filter: lfs\s*$/.test(attr.trim())) {
+			const lfsTracked = await this.store.isLfsTracked(binPath);
+			if (!lfsTracked) {
 				const current = (await this.exists(".gitattributes")) ? await this.readText(".gitattributes") : "";
 				await this.writeText(".gitattributes", `${current}${current && !current.endsWith("\n") ? "\n" : ""}*.${ext} filter=lfs diff=lfs merge=lfs -text\n`);
 				paths.push(".gitattributes");
