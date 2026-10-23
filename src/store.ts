@@ -1,11 +1,11 @@
 import type { FileChange } from "./util.js";
 
-/** Dates and authors of a file from its history: the last commit that touched it and the first. */
+/** Dates and authors of a file from its history: the last commit that touched it and, when known, the first. */
 export interface FileDates {
 	updatedAt: string;
 	updatedBy: string;
-	createdAt: string;
-	createdBy: string;
+	createdAt?: string;
+	createdBy?: string;
 }
 
 /** One commit as the history tools need it. `files` only from `log`. */
