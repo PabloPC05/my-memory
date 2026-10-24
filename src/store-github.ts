@@ -5,6 +5,7 @@ import { GitHubClient, GitHubError, type GitHubRepoConfig } from "./github.js";
 import { type Logger, silentLogger } from "./log.js";
 import { type Author, EMPTY_TREE, type FetchResult, type FileDates, type LogEntry, type NoteStore, type PushResult, parseTrailers, StoreConflictError } from "./store.js";
 import { readTarGz } from "./tar.js";
+import { mapLimit } from "./util.js";
 import type { FileChange } from "./util.js";
 
 export interface GitHubStoreOptions extends GitHubRepoConfig {
@@ -54,20 +55,6 @@ function fileChanges(files: ApiFile[] | undefined): FileChange[] {
 		const s = STATUS[f.status] ?? "M";
 		return (s === "R" || s === "C") && f.previous_filename ? { status: s, path: f.filename, from: f.previous_filename } : { status: s, path: f.filename };
 	});
-}
-
-async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-	const out: R[] = new Array(items.length);
-	let next = 0;
-	await Promise.all(
-		Array.from({ length: Math.min(limit, items.length) }, async () => {
-			while (next < items.length) {
-				const i = next++;
-				out[i] = await fn(items[i] as T);
-			}
-		}),
-	);
-	return out;
 }
 
 /**

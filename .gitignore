@@ -5,3 +5,6 @@ result
 *.log
 public/
 .vercel/
+
+.vercel
+.env*

@@ -60,8 +60,9 @@ export async function fakeDrive(initial: FakeFile[] = []): Promise<FakeDrive> {
 		if (req.method === "GET" && p === "/drive/v3/changes/startPageToken") return send(res, 200, { startPageToken: String(changes.length) });
 		if (req.method === "GET" && p === "/drive/v3/changes") {
 			const from = Number(q.get("pageToken"));
-			const out = changes.slice(from).map((c) => ({ fileId: c.fileId, removed: c.removed, ...(files.has(c.fileId) ? { file: api(files.get(c.fileId) as FakeFile) } : {}) }));
-			return send(res, 200, { changes: out, newStartPageToken: String(changes.length) });
+			// Like Drive: 50 changes a page, whatever pageSize asks for.
+			const out = changes.slice(from, from + 50).map((c) => ({ fileId: c.fileId, removed: c.removed, ...(files.has(c.fileId) ? { file: api(files.get(c.fileId) as FakeFile) } : {}) }));
+			return send(res, 200, from + 50 < changes.length ? { changes: out, nextPageToken: String(from + 50) } : { changes: out, newStartPageToken: String(changes.length) });
 		}
 		if (req.method === "GET" && p === "/drive/v3/files") {
 			if (q.get("spaces") === "appDataFolder") {
@@ -71,6 +72,10 @@ export async function fakeDrive(initial: FakeFile[] = []): Promise<FakeDrive> {
 			const full = /fullText contains '((?:[^'\\]|\\.)*)'/.exec(q.get("q") ?? "")?.[1];
 			let list = [...files.values()].filter((f) => !f.trashed);
 			if (full) list = list.filter((f) => f.content?.toString("utf8").toLowerCase().includes(full.replace(/\\(.)/g, "$1").toLowerCase()));
+			const since = /modifiedTime >= '([^']+)'/.exec(q.get("q") ?? "")?.[1];
+			const before = /modifiedTime < '([^']+)'/.exec(q.get("q") ?? "")?.[1];
+			if (since) list = list.filter((f) => (f.modifiedTime ?? "") >= since);
+			if (before) list = list.filter((f) => (f.modifiedTime ?? "") < before);
 			const size = Number(q.get("pageSize") ?? 100);
 			const start = Number(q.get("pageToken") ?? 0);
 			const page = list.slice(start, start + size);

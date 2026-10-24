@@ -23,7 +23,8 @@ afterEach(async () => {
 });
 
 async function index(d: FakeDrive, snapshot = true): Promise<DriveFiles> {
-	const files = new DriveFiles(new DriveClient({ clientId: "c", clientSecret: "s", refreshToken: "r", apiUrl: d.url, tokenUrl: d.tokenUrl }), { snapshot });
+	// Few lists at once: on Windows, many local connections at a time trip up the other test files' fakes.
+	const files = new DriveFiles(new DriveClient({ clientId: "c", clientSecret: "s", refreshToken: "r", apiUrl: d.url, tokenUrl: d.tokenUrl }), { snapshot, parallel: 2 });
 	await files.start();
 	return files;
 }
@@ -41,6 +42,28 @@ describe("DriveFiles", () => {
 		expect(files.search("apuntes")[0]?.id).toBe("apuntes"); // the name itself first
 		expect(files.folderByPath("Memoria/Fuentes")?.id).toBe("fuentes");
 		expect(files.filesUnder("fuentes").map((f) => f.id)).toEqual(["contrato"]);
+	});
+
+	it("lists a big Drive (more than one page) in spans of time side by side, every file once", async () => {
+		const many = Array.from({ length: 1500 }, (_, i) => ({ id: `f${i}`, name: `Archivo ${i}.txt`, mimeType: "text/plain", parents: [ROOT], modifiedTime: `${2003 + (i % 25)}-06-01T10:00:00.000Z` }));
+		drive = await fakeDrive(many);
+		const files = await index(drive, false);
+		expect(files.size).toBe(1500);
+		expect(files.search("archivo 1499")[0]?.id).toBe("f1499");
+		expect(drive.calls.filter((c) => c === "GET /drive/v3/files").length).toBeGreaterThan(20); // the first page, then the spans
+	});
+
+	it("after a burst of changes (more pages than it is worth reading), lists everything again", async () => {
+		drive = await fakeDrive(SEED);
+		const files = await index(drive, false);
+		for (let i = 0; i < 2100; i++) drive.update("notas", { name: `notas ${i}.txt` });
+		drive.add({ id: "nuevo", name: "Recibo.pdf", mimeType: PDF, parents: ["fuentes"] });
+		drive.calls.length = 0;
+		const changed = await files.refresh();
+		expect(drive.calls.filter((c) => c === "GET /drive/v3/changes")).toHaveLength(40);
+		expect(changed).toContain("nuevo");
+		expect(files.get("notas")?.name).toBe("notas 2099.txt");
+		expect(await files.refresh()).toEqual([]); // and from the new point on, as usual
 	});
 
 	it("follows Drive's changes: new, renamed, moved and deleted files", async () => {

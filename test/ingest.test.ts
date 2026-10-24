@@ -89,7 +89,11 @@ describe("ingestion of the sources folder", () => {
 		drive.add({ id: "roto", name: "Roto.txt", mimeType: "text/plain", parents: ["fuentes"], content: Buffer.from("x") });
 		for (let i = 0; i < 4; i++) await ingester.run("test");
 		expect(seen).toHaveLength(3);
-		expect((await memory.readState<SourcesState>("sources"))?.files.roto).toMatchObject({ status: "failed", attempts: 3, error: "model unavailable" });
+		const state = (await memory.readState<SourcesState>("sources")) as SourcesState;
+		expect(state.files.roto).toMatchObject({ status: "failed", attempts: 3, error: "model unavailable" });
+		const sources = (ingester as unknown as { sources: DriveSources }).sources;
+		expect(sources.pending(state).map((t) => t.id)).toEqual([]);
+		expect(sources.pending(state, Date.now() + 25 * 3600 * 1000).map((t) => t.id)).toEqual(["roto"]); // once a day
 		drive.update("roto", { content: Buffer.from("y") });
 		await ingester.run("test");
 		expect(seen).toHaveLength(4);

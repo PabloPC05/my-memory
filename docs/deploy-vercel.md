@@ -24,7 +24,7 @@ The server reads your Drive as you, with a refresh token. One way to get it, wit
 2. Open the [OAuth 2.0 Playground](https://developers.google.com/oauthplayground), click the gear, tick *Use your own OAuth credentials* and paste the client id and secret.
 3. Authorize these scopes: `https://www.googleapis.com/auth/drive.readonly` and `https://www.googleapis.com/auth/drive.appdata`, then *Exchange authorization code for tokens* and copy the **refresh token**.
 
-`drive.readonly` is enough to index, search and read; my-memory never changes your files. `drive.appdata` lets it keep a snapshot of the index in the app's hidden folder of your Drive, so a cold start reads one small file instead of listing your whole Drive; without it everything still works, only cold starts are slower.
+`drive.readonly` is enough to index, search and read; my-memory never changes your files. `drive.appdata` lets it keep a snapshot of the index in the app's hidden folder of your Drive, so a cold start reads one small file instead of listing your whole Drive; without it everything still works, only cold starts are slower (listing 54 000 files takes about 40 s).
 
 ## 2. Deploy
 
@@ -47,6 +47,7 @@ Import the my-memory repository (or your fork) in Vercel; `vercel.json` already 
 | `INGEST_BASE_URL` | Required for `openai` (`https://api.openai.com/v1`, `https://openrouter.ai/api/v1`, …) |
 | `INGEST_WEBHOOK_URL`, `INGEST_WEBHOOK_SECRET` | For `webhook` |
 | `INGEST_MAX_FILES`, `INGEST_MAX_STEPS` | Per run (default 10) and tool calls per source (default 30) |
+| `INGEST_THINKING` | `true` or `false`: extended thinking for `anthropic` (default on with Anthropic's API, off with `INGEST_BASE_URL`, since compatible APIs often reject it) |
 | `FUNCTION_MAX_DURATION` | Match `maxDuration` in `vercel.json` if you change it (Pro allows up to 800) |
 | `EMBEDDINGS_URL`, `EMBEDDINGS_MODEL`, `EMBEDDINGS_API_KEY` | Optional search by meaning, as `[embeddings]` in the README |
 
@@ -63,14 +64,14 @@ Then give the agent the setup link from the README, as with a self-hosted memory
 
 - **Notes.** A cold start downloads the repository as one tarball and builds the index in `/tmp` (seconds for a few thousand notes). Each request first asks GitHub whether the branch moved (one small API call, at most every 5 s) and applies the difference, so several copies of the function running at once see each other's writes. A write is a commit made through GitHub's API and published by moving the branch without force; if another copy changed other notes meanwhile, it is rebased on top; if it changed the same note, the write fails with `REMOTE_CONFLICT` and the agent reads the note again. Your backup is the GitHub repository (any `git clone` of it).
 - **Files.** `files_search` answers by name from memory in milliseconds; `content: true` asks Drive's full-text index. `files_read` gives the text of text files, Google Docs, Sheets (CSV), Slides and Word documents; other files (PDF, images…) come back whole for the agent to read. Files only shared with you, outside My Drive, are left out.
-- **Sources.** Each document's identity is its Drive file id, which survives renames, moves and new versions. What the memory integrated, and at which version, is kept in `.my-memory/sources.json` in the notes repository (hidden from the tools). A run compares the folder with that file, so a lost notice only delays a document until the next run. A new version of a document is integrated again (the agent updates the notes that cite it); a removed one is marked in those notes as no longer available. A document that fails is retried up to 3 times, then waits for a new version. A run takes a lease in the same file, so two notices for the same upload never ingest it twice.
+- **Sources.** Each document's identity is its Drive file id, which survives renames, moves and new versions. What the memory integrated, and at which version, is kept in `.my-memory/sources.json` in the notes repository (hidden from the tools). A run compares the folder with that file, so a lost notice only delays a document until the next run. A new version of a document is integrated again (the agent updates the notes that cite it); a removed one is marked in those notes as no longer available. A document that fails is retried up to 3 times, then once a day, or at once when a new version arrives. A run takes a lease in the same file, so two notices for the same upload never ingest it twice.
 - **Triggers.** Drive calls `/hooks/drive` within seconds of a change; the answer is immediate and the work continues in the background (`waitUntil`). The daily cron is the safety net and renews the push channel, which Drive keeps for a week at most. When a run has no time left (it stops starting documents 2 minutes before the function's limit), it starts a new invocation for the rest.
 
 ## Limits
 
 - **Time:** 300 s per invocation on Hobby (up to 800 s on Pro). Long documents with many notes to update may take a minute each with the default model.
 - **`/tmp`:** 500 MB per instance; the notes, the index and uploads go there. Fine for text notes; a memory full of large attachments is better self-hosted.
-- **No OCR or `pdftotext`** in the function: `attach` stores files, but scanned PDFs are not turned into text. Documents in the sources folder do not need it: the ingestion agent reads PDFs and images itself (Claude), and Drive's full-text index already covers them for `files_search`.
+- **No OCR or `pdftotext`** in the function: `attach` stores files, but scanned PDFs are not turned into text. Documents in the sources folder do not need it: the ingestion agent reads PDFs and images itself (Claude), or gets a PDF's text extracted in JavaScript when its model or API takes no PDFs, and Drive's full-text index already covers them for `files_search`.
 - **Uploads** (`PUT /uploads/…` then `attach`) only work when both requests reach the same instance; prefer the sources folder for documents.
 - **No OAuth sign-in** (the self-hosted public listener delegates it to Forgejo): clients use static tokens.
 

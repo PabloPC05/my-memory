@@ -127,6 +127,7 @@ function ingest(t: Record<string, unknown> | undefined, base: string, read: bool
 		maxFilesPerRun: t.max_files_per_run === undefined ? undefined : positiveInt(t.max_files_per_run, "ingest.max_files_per_run", 3),
 		maxSteps: t.max_steps === undefined ? undefined : positiveInt(t.max_steps, "ingest.max_steps", 30),
 		maxChars: t.max_chars === undefined ? undefined : positiveInt(t.max_chars, "ingest.max_chars", 200_000),
+		...(t.thinking === undefined ? {} : { thinking: Boolean(t.thinking) }),
 	};
 }
 

@@ -76,6 +76,7 @@ export function configFromEnv(env: Env = process.env): ServerlessConfig {
 				webhookSecret: opt(env, "INGEST_WEBHOOK_SECRET"),
 				maxFilesPerRun: int(env, "INGEST_MAX_FILES", 10),
 				maxSteps: int(env, "INGEST_MAX_STEPS", 30),
+				...(opt(env, "INGEST_THINKING") ? { thinking: opt(env, "INGEST_THINKING") === "true" } : {}),
 			}
 		: null;
 	const tokens = need(env, "MEMORY_TOKENS");
@@ -178,7 +179,8 @@ let instance: Promise<ServerlessApp> | null = null;
 
 /** The Vercel function: one app per instance, built on the first request (the cold start). */
 export default function handler(req: IncomingMessage, res: ServerResponse): void {
-	instance ??= createServerlessApp(configFromEnv(), { background: waitUntil }).catch((error) => {
+	// configFromEnv inside the promise: a bad configuration answers with its reason instead of crashing the function.
+	instance ??= Promise.resolve().then(() => createServerlessApp(configFromEnv(), { background: waitUntil })).catch((error) => {
 		instance = null;
 		throw error;
 	});

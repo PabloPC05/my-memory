@@ -1,8 +1,8 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { betaTool } from "@anthropic-ai/sdk/helpers/beta/json-schema";
 import type { DriveFiles, FileContent } from "./drive-files.js";
 import { MemoryError } from "./errors.js";
 import { type Logger, silentLogger } from "./log.js";
+import { pdfText } from "./pdf-text.js";
 import type { ClientIdentity, MemoryService } from "./memory.js";
 import { type DriveSources, emptySources, MAX_ATTEMPTS, type SourceTask, type SourcesState } from "./sources.js";
 
@@ -27,6 +27,8 @@ export interface IngestConfig {
 	maxFilesPerRun?: number;
 	/** Tool calls per source. Default 30. */
 	maxSteps?: number;
+	/** Extended thinking (anthropic). Default on with Anthropic's API, off with a `baseUrl` (proxies often reject it). */
+	thinking?: boolean;
 	/** Characters of a text source given to the agent. Default 200000. */
 	maxChars?: number;
 }
@@ -134,28 +136,52 @@ export class AnthropicAgent implements IngestAgent {
 	async handle(task: SourceTask, content: FileContent | null): Promise<IngestOutcome> {
 		const touched = new Set<string>();
 		const client: ClientIdentity = { id: "ingest", name: `Ingestion (${this.name})`, scope: "write" };
-		const blocks: Anthropic.Beta.BetaContentBlockParam[] = [{ type: "text", text: ingestBrief(task) }];
+		// The document first, then the brief (as in the API's own examples for documents).
+		const blocks: Anthropic.ContentBlockParam[] = [];
 		if (content?.kind === "text") blocks.push({ type: "text", text: `<document name="${task.name}" id="${task.id}">\n${content.text}\n</document>${content.truncated ? "\n(The document was cut here.)" : ""}` });
 		else if (content?.kind === "binary" && content.mimeType === "application/pdf") blocks.push({ type: "document", title: task.name, source: { type: "base64", media_type: "application/pdf", data: content.data.toString("base64") } });
 		else if (content?.kind === "binary" && IMAGE.has(content.mimeType)) blocks.push({ type: "image", source: { type: "base64", media_type: content.mimeType as "image/png", data: content.data.toString("base64") } });
 		else if (content?.kind === "binary") throw new Error(`Files of type ${content.mimeType} cannot be read by the ingestion agent.`);
-		const tools = memoryTools(this.memory, client, touched).map((t) =>
-			betaTool({ name: t.name, description: t.description, inputSchema: t.schema as { type: "object" }, run: (args) => runTool(t, args as Record<string, unknown>) }),
-		);
-		const final = await this.client.beta.messages.toolRunner({
-			model: this.name,
-			max_tokens: 16_000,
-			thinking: { type: "adaptive" },
-			system: await this.memory.instructions(),
-			messages: [{ role: "user", content: blocks }],
-			tools,
-			max_iterations: this.config.maxSteps ?? 30,
-		});
-		const summary = final.content
-			.filter((b): b is Anthropic.Beta.BetaTextBlock => b.type === "text")
-			.map((b) => b.text)
+		blocks.push({ type: "text", text: ingestBrief(task) });
+		const specs = memoryTools(this.memory, client, touched);
+		const tools: Anthropic.Tool[] = specs.map((t) => ({ name: t.name, description: t.description, input_schema: t.schema as Anthropic.Tool.InputSchema }));
+		const system = await this.memory.instructions();
+		// The whole conversation goes in every request (no server-side state), so any Anthropic-compatible API works.
+		const messages: Anthropic.MessageParam[] = [{ role: "user", content: blocks }];
+		// Thinking on Anthropic's own API; compatible proxies often reject it, so off there unless asked for.
+		const thinking = this.config.thinking ?? !this.config.baseUrl;
+		let last: Anthropic.Message | null = null;
+		const ask = () =>
+			this.client.messages.stream({ model: this.name, max_tokens: 16_000, ...(thinking ? { thinking: { type: "adaptive" as const } } : {}), system, messages, tools }).finalMessage();
+		for (let step = 0; step < (this.config.maxSteps ?? 30); step++) {
+			try {
+				last = await ask();
+			} catch (error) {
+				// Some Anthropic-compatible APIs take no PDFs: the first turn goes again with the PDF's text instead.
+				const pdf = step === 0 && content?.kind === "binary" && content.mimeType === "application/pdf" && error instanceof Anthropic.APIError && error.status === 400;
+				const text = pdf ? await pdfText(content.data) : null;
+				if (!text) throw error;
+				blocks[0] = { type: "text", text: `<document name="${task.name}" id="${task.id}">\n${text.slice(0, this.config.maxChars ?? 200_000)}\n</document>` };
+				last = await ask();
+			}
+			messages.push({ role: "assistant", content: last.content });
+			if (last.stop_reason === "pause_turn") continue;
+			const uses = last.content.filter((c): c is Anthropic.ToolUseBlock => c.type === "tool_use");
+			if (last.stop_reason !== "tool_use" || uses.length === 0) break;
+			const results: Anthropic.ToolResultBlockParam[] = [];
+			for (const use of uses) {
+				const spec = specs.find((t) => t.name === use.name);
+				const text = spec ? await runTool(spec, use.input as Record<string, unknown>) : JSON.stringify({ error: { code: "UNKNOWN_TOOL" } });
+				results.push({ type: "tool_result", tool_use_id: use.id, content: text, ...(text.startsWith('{"error"') ? { is_error: true } : {}) });
+			}
+			messages.push({ role: "user", content: results });
+		}
+		const summary = (last?.content ?? [])
+			.filter((c): c is Anthropic.TextBlock => c.type === "text")
+			.map((c) => c.text)
 			.join("\n")
 			.trim();
+		if (last?.stop_reason === "tool_use") return { summary: `Stopped at the step limit. ${summary}`.trim().slice(0, 1000), notes: [...touched] };
 		return { summary: summary.slice(0, 1000), notes: [...touched] };
 	}
 }
@@ -175,8 +201,13 @@ export class OpenAICompatibleAgent implements IngestAgent {
 		this.name = config.model;
 	}
 
-	async handle(task: SourceTask, content: FileContent | null): Promise<IngestOutcome> {
-		if (content?.kind === "binary") throw new Error(`This provider reads text only; «${task.name}» is ${content.mimeType}.`);
+	async handle(task: SourceTask, given: FileContent | null): Promise<IngestOutcome> {
+		let content = given;
+		if (content?.kind === "binary" && content.mimeType === "application/pdf") {
+			const text = await pdfText(content.data);
+			if (text) content = { kind: "text", text: text.slice(0, this.config.maxChars ?? 200_000), mimeType: "text/plain", truncated: text.length > (this.config.maxChars ?? 200_000) };
+		}
+		if (content?.kind === "binary") throw new Error(`This provider reads text only; «${task.name}» is ${content.mimeType}${content.mimeType === "application/pdf" ? " without a text layer" : ""}.`);
 		const touched = new Set<string>();
 		const client: ClientIdentity = { id: "ingest", name: `Ingestion (${this.name})`, scope: "write" };
 		const tools = memoryTools(this.memory, client, touched);

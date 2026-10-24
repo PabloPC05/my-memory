@@ -7,6 +7,11 @@ const FIELDS = "id,name,mimeType,parents,modifiedTime,size,md5Checksum,trashed,w
 export const FOLDER = "application/vnd.google-apps.folder";
 const SNAPSHOT = "my-memory-drive-index.json.gz";
 const SNAPSHOT_EVERY_MS = 60_000;
+/**
+ * Drive hands its changes 50 at a time. A burst (Google once logged 51 000 changes to one Drive in a second) would take
+ * hours of pages; past this many pages, listing everything again is faster.
+ */
+const MAX_CHANGE_PAGES = 40;
 
 /** One file or folder of the user's Drive, as the index keeps it. */
 export interface DriveFile {
@@ -83,12 +88,14 @@ export class DriveFiles {
 	private dirty = false;
 	private readonly listeners = new Set<(ids: string[]) => void>();
 	private readonly log: Logger;
+	private readonly parallel: number;
 
 	constructor(
 		readonly drive: DriveClient,
-		opts: { log?: Logger; snapshot?: boolean } = {},
+		opts: { log?: Logger; snapshot?: boolean; /** Lists at once when listing a big Drive. Default 16. */ parallel?: number } = {},
 	) {
 		this.log = opts.log ?? silentLogger;
+		this.parallel = opts.parallel ?? 16;
 		this.snapshotOff = opts.snapshot === false;
 	}
 
@@ -180,14 +187,46 @@ export class DriveFiles {
 		// The token first: whatever changes while listing comes in with the next refresh.
 		this.pageToken = (await this.drive.json<{ startPageToken: string }>("GET", "/drive/v3/changes/startPageToken")).startPageToken;
 		const files = new Map<string, DriveFile>();
-		let page: string | undefined;
-		do {
-			const r = await this.drive.json<{ files: ApiFile[]; nextPageToken?: string }>("GET", "/drive/v3/files", {
-				query: { q: "trashed = false", pageSize: 1000, pageToken: page, fields: `nextPageToken,files(${FIELDS})`, spaces: "drive" },
-			});
-			for (const f of r.files) files.set(f.id, toFile(f));
-			page = r.nextPageToken;
-		} while (page);
+		// At most `parallel` requests at a time.
+		let running = 0;
+		const waiting: (() => void)[] = [];
+		const page = async (q: string, pageToken?: string): Promise<{ files: ApiFile[]; nextPageToken?: string }> => {
+			while (running >= this.parallel) await new Promise<void>((ok) => waiting.push(ok));
+			running++;
+			try {
+				const r: { files: ApiFile[]; nextPageToken?: string } = await this.drive.json("GET", "/drive/v3/files", {
+					query: { q, pageSize: 1000, pageToken, fields: `nextPageToken,files(${FIELDS})`, spaces: "drive" },
+				});
+				for (const f of r.files) files.set(f.id, toFile(f));
+				return r;
+			} finally {
+				running--;
+				waiting.shift()?.();
+			}
+		};
+		const query = (from: number, to: number) => `trashed = false and modifiedTime >= '${new Date(from).toISOString()}' and modifiedTime < '${new Date(to).toISOString()}'`;
+		// A big Drive is many pages in a row (54 000 files: 4½ minutes). Instead, a span of time that has more than
+		// one page is cut in two and both halves are listed side by side, until each fits in a page; only files changed
+		// within the same second are paged.
+		const span = async (from: number, to: number): Promise<void> => {
+			const q = query(from, to);
+			const r = await page(q);
+			if (!r.nextPageToken) return;
+			if (to - from > 1000) {
+				const mid = from + Math.floor((to - from) / 2);
+				await Promise.all([span(from, mid), span(mid, to)]);
+				return;
+			}
+			for (let token: string | undefined = r.nextPageToken; token; ) token = (await page(q, token)).nextPageToken;
+		};
+		if ((await page("trashed = false")).nextPageToken) {
+			// Every date counts: some files carry dates far in the past or in the future (a wrong clock). Drive refuses
+			// dates before 1970.
+			const next = new Date().getUTCFullYear() + 1;
+			const years = Array.from({ length: next - 2005 + 1 }, (_, i) => Date.UTC(2005 + i, 0, 1));
+			const edges = [Date.UTC(1970, 0, 1), ...years, Date.UTC(2200, 0, 1)];
+			await Promise.all(edges.slice(1).map((to, i) => span(edges[i] as number, to)));
+		}
 		this.files = files;
 		this.invalidate();
 		this.dirty = true;
@@ -202,7 +241,14 @@ export class DriveFiles {
 			if (!this.pageToken) return [];
 			const changed: string[] = [];
 			let token: string | undefined = this.pageToken;
-			while (token) {
+			for (let pages = 0; token; pages++) {
+				if (pages === MAX_CHANGE_PAGES) {
+					this.log("info", "drive.changes_burst", { pages });
+					await this.listAll();
+					const all = [...this.files.keys()];
+					for (const fn of this.listeners) fn(all);
+					return all;
+				}
 				const r: { changes: { fileId: string; removed?: boolean; file?: ApiFile }[]; nextPageToken?: string; newStartPageToken?: string } = await this.drive.json("GET", "/drive/v3/changes", {
 					query: { pageToken: token, pageSize: 1000, includeRemoved: true, spaces: "drive", fields: `nextPageToken,newStartPageToken,changes(fileId,removed,file(${FIELDS}))` },
 				});

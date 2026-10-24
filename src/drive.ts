@@ -66,7 +66,7 @@ export class DriveClient {
 				r = await fetch(url, { method, headers, body: opts.body as Uint8Array | string | undefined, signal: AbortSignal.timeout(60_000) });
 			} catch (error) {
 				if (attempt === 0) continue;
-				throw new DriveError(0, `Google Drive is unreachable: ${(error as Error).message}`);
+				throw new DriveError(0, `Google Drive is unreachable: ${(error as Error).message}${(error as { cause?: Error }).cause ? ` (${(error as { cause: Error }).cause.message})` : ""}`);
 			}
 			if (r.status === 401 && attempt === 0) {
 				this.access = null;

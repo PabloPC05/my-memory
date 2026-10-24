@@ -37,6 +37,8 @@ export interface SourceTask {
 }
 
 export const MAX_ATTEMPTS = 3;
+/** After MAX_ATTEMPTS, a failed version is tried again once a day (the provider or the config may have been fixed). */
+const RETRY_FAILED_MS = 24 * 3600 * 1000;
 export const emptySources = (): SourcesState => ({ v: 1, files: {} });
 
 const versionOf = (f: DriveFile) => f.md5 ?? f.modifiedTime;
@@ -68,7 +70,7 @@ export class DriveSources {
 	}
 
 	/** What is new, changed or gone since the state, oldest change first. Failed versions wait for a new one. */
-	pending(state: SourcesState): SourceTask[] {
+	pending(state: SourcesState, now = Date.now()): SourceTask[] {
 		const folder = this.folderId();
 		const present = folder ? this.files.filesUnder(folder) : [];
 		const tasks: SourceTask[] = [];
@@ -77,7 +79,8 @@ export class DriveSources {
 			seen.add(f.id);
 			const version = versionOf(f);
 			const known = state.files[f.id];
-			if (known?.version === version && (known.status !== "failed" || (known.attempts ?? 1) >= MAX_ATTEMPTS)) continue;
+			const waiting = known?.status === "failed" && (known.attempts ?? 1) >= MAX_ATTEMPTS && now - Date.parse(known.at) < RETRY_FAILED_MS;
+			if (known?.version === version && (known.status !== "failed" || waiting)) continue;
 			const path = this.files.pathOf(f.id) ?? f.name;
 			tasks.push({ kind: known?.ingested ? "changed" : "added", id: f.id, name: f.name, path, version, mimeType: f.mimeType, previous: known ?? null });
 		}
