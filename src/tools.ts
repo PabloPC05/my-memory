@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { DriveError } from "./drive.js";
 import { MemoryError } from "./errors.js";
 import { LINT_KINDS } from "./lint.js";
 import type { ClientsService } from "./clients.js";
@@ -173,6 +174,82 @@ export async function createMcpServer(memory: MemoryService, client: ClientIdent
 				annotations: read,
 			},
 			wrap("clients", () => clients.report()),
+		);
+	}
+
+	// The user's files (Google Drive), when the memory is set up with them.
+	const files = memory.files;
+	if (files) {
+		const wrapFiles = <A extends Record<string, unknown>>(tool: string, fn: (args: A) => unknown) =>
+			wrap(tool, async (args: A) => {
+				await files.refreshIfStale().catch((error) => log("warn", "drive.refresh_failed", { error: String(error) }));
+				try {
+					return await fn(args);
+				} catch (error) {
+					if (error instanceof DriveError) throw new MemoryError(error.status === 404 ? "NOT_FOUND" : "INVALID_ARGUMENT", error.message);
+					throw error;
+				}
+			});
+		server.registerTool(
+			"files_search",
+			{
+				title: "Search the user's files",
+				description:
+					"The user's files (their Google Drive) by name or by content. By name (default) it answers from an index in memory, instantly: every word must be in the file's name or path, accents ignored. `content: true` searches inside the files with Drive's full-text index (PDFs, documents and scanned images too). Returns id, name, path, type, size and date; read one with files_read.",
+				inputSchema: {
+					query: z.string().describe("Words to look for."),
+					content: z.boolean().optional().describe("Search inside the files instead of by name (slower)."),
+					folder: z.string().optional().describe("Only under this folder path, e.g. «Universidad/Apuntes» (by name only)."),
+					limit: z.number().int().min(1).max(200).optional().describe("Default 20."),
+				},
+				annotations: read,
+			},
+			wrapFiles("files_search", async (a: { query: string; content?: boolean; folder?: string; limit?: number }) => ({
+				hits: a.content ? await files.searchContent(a.query, a.limit ?? 20) : files.search(a.query, { limit: a.limit, folder: a.folder }),
+			})),
+		);
+		server.registerTool(
+			"files_info",
+			{
+				title: "A file's details",
+				description: "Name, path, type, size, date and link of a file by its id (the one in `source:<id>` references and in files_search results).",
+				inputSchema: { id: z.string().describe("The file's id.") },
+				annotations: read,
+			},
+			wrapFiles("files_info", (a: { id: string }) => {
+				const f = files.get(a.id.replace(/^source:/, ""));
+				if (!f) throw new MemoryError("NOT_FOUND", `No file with id «${a.id}».`);
+				return files.hit(f);
+			}),
+		);
+		server.registerTool(
+			"files_read",
+			{
+				title: "Read a file",
+				description:
+					"A file's content by its id: the text of text files and of Google Docs, Sheets (as CSV) and Slides; any other file (PDF, image, Word…) comes back whole as a resource, for you to read directly, up to 20 MB.",
+				inputSchema: { id: z.string().describe("The file's id."), max_chars: z.number().int().min(1000).max(500_000).optional().describe("For text: at most this many characters (default 100000).") },
+				annotations: read,
+			},
+			async (a: { id: string; max_chars?: number }): Promise<CallToolResult> => {
+				const id = a.id.replace(/^source:/, "");
+				try {
+					await files.refreshIfStale().catch(() => undefined);
+					const c = await files.read(id, { maxChars: a.max_chars });
+					const meta = files.get(id);
+					log("info", "tool", { client: client.id, tool: "files_read", path: meta?.name ?? id, outcome: "ok" });
+					if (c.kind === "text") return ok({ ...(meta ? files.hit(meta) : { id }), mime_type: c.mimeType, text: c.text, ...(c.truncated ? { truncated: true } : {}) });
+					return {
+						content: [
+							{ type: "text", text: JSON.stringify(meta ? files.hit(meta) : { id }) },
+							{ type: "resource", resource: { uri: `drive://file/${id}`, mimeType: c.mimeType, blob: c.data.toString("base64") } },
+						],
+					};
+				} catch (error) {
+					log("info", "tool", { client: client.id, tool: "files_read", path: id, outcome: "error" });
+					return fail(error instanceof DriveError ? new MemoryError(error.status === 404 ? "NOT_FOUND" : "INVALID_ARGUMENT", error.message) : error);
+				}
+			},
 		);
 	}
 

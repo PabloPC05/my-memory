@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { Git } from "../src/git.js";
-import { parseNameStatus } from "../src/util.js";
+import { type FileChange, parseNameStatus } from "../src/util.js";
 
 export interface FakeGitHub {
 	url: string;
@@ -48,7 +48,7 @@ export async function fakeGitHub(bare: string, owner = "alex", repo = "memoria",
 		};
 		if (withFiles) {
 			const parent = (parents ?? "").trim().split(" ")[0];
-			const changes = parent ? parseNameStatus(await git.out(["diff", "-M", "--name-status", parent, sha])) : (await git.out(["ls-tree", "-r", "--name-only", sha])).trim().split("\n").filter(Boolean).map((p) => ({ status: "A", path: p }));
+			const changes: FileChange[] = parent ? parseNameStatus(await git.out(["diff", "-M", "--name-status", parent, sha])) : (await git.out(["ls-tree", "-r", "--name-only", sha])).trim().split("\n").filter(Boolean).map((p) => ({ status: "A", path: p }));
 			out.files = changes.map((c) => ({ filename: c.path, status: STATUS[c.status] ?? "modified", ...(c.from ? { previous_filename: c.from } : {}) }));
 		}
 		return out;

@@ -14,6 +14,7 @@ import { firstH1, rewriteWikiLinks, splitSections, targetNameOf } from "./markdo
 import type { OcrRunner } from "./ocr.js";
 import { parseTypedLinks } from "./relations.js";
 import { SETUP_GUIDE_URI, SETUP_GUIDE_URL } from "./setup-guide.js";
+import type { DriveFiles } from "./drive-files.js";
 import { type Author, EMPTY_TREE, type NoteStore, StoreConflictError } from "./store.js";
 import { GitStore } from "./store-git.js";
 import { buildFtsQuery, type NoteRow, type SearchHit, SearchIndex } from "./search-index.js";
@@ -74,6 +75,8 @@ export interface MemoryOptions {
 	embeddingsRetry?: { initialMs: number; maxMs: number };
 	/** Where the notes live; by default a git working clone at `repoDir` (GitStore). */
 	store?: NoteStore;
+	/** The user's files (Google Drive), for the files_* tools and the sources folder. */
+	files?: DriveFiles | null;
 }
 
 export type SearchMode = "hybrid" | "text" | "semantic";
@@ -133,11 +136,14 @@ export class MemoryService {
 	private syncRequested = false;
 	/** Background embedding of sections; null when `[embeddings]` is not configured. */
 	readonly embedder: Embedder | null = null;
+	/** The user's files (Google Drive), when configured. */
+	readonly files: DriveFiles | null;
 
 	constructor(readonly opts: MemoryOptions) {
 		this.log = opts.log ?? silentLogger;
 		this.branch = opts.branch ?? "main";
 		this.pushDelay = opts.pushRetry?.initialMs ?? 30_000;
+		this.files = opts.files ?? null;
 		this.store =
 			opts.store ??
 			new GitStore({ repoDir: opts.repoDir, branch: this.branch, remote: opts.remote, committer: opts.committer ?? { name: "my-memory", email: `my-memory@${this.authorDomain()}` } });
