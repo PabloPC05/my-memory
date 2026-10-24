@@ -147,6 +147,21 @@ export async function createMcpServer(memory: MemoryService, client: ClientIdent
 		wrap("recent", (a: { limit?: number; since?: string; folder?: string; client?: string; include_archive?: boolean }) => memory.recent(a)),
 	);
 
+	const stateSections = memory.conventions.resume.sections.map((h) => `«${h}»`).join(", ");
+	server.registerTool(
+		"resume",
+		{
+			title: "Pick up a topic",
+			description: `Pick up a topic where another agent or chat left it, in one cheap call: give the topic (a note's name or path, or a few words) and get its note's description, its state sections whole (${stateSections}), the latest changes to it (when, who, why) and the headings of the other sections, to read only those you need. Pass \`since\` (your last visit) to get only what changed after it. While you work on a topic, keep those state sections current with edit (what is being done, what comes next, what is open), so the next agent can resume from them without reading everything.`,
+			inputSchema: {
+				topic: z.string().describe("A note's name or path, or words about the topic."),
+				since: z.string().optional().describe("Only changes after this: an ISO date (2026-05-01) or an age like 7d, 12h."),
+			},
+			annotations: read,
+		},
+		wrap("resume", (a: { topic: string; since?: string }) => memory.resume(a)),
+	);
+
 	server.registerTool(
 		"lint",
 		{

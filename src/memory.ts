@@ -114,6 +114,25 @@ export interface RecentCommit {
 	notes: { path: string; name?: string; change: "added" | "modified" | "deleted" | "moved" | "copied"; from?: string }[];
 }
 
+/** What `resume` returns: the state sections when the note has them, else its beginning. */
+export interface ResumeResult {
+	path: string;
+	name: string;
+	description: string | null;
+	hash: string;
+	updated_at: string | null;
+	updated_by: string | null;
+	state?: { heading: string; text: string }[];
+	intro?: string;
+	note?: string;
+	truncated?: boolean;
+	other_sections: string[];
+	since?: string;
+	changed?: boolean;
+	changes: { date: string; by: string; why: string }[];
+	other_candidates?: { path: string; description: string | null }[];
+}
+
 /** Where the server keeps a state file of its own in the notes repo. */
 function stateFile(name: string): string {
 	if (!/^[a-z0-9-]+$/.test(name)) throw new MemoryError("INVALID_ARGUMENT", `Invalid state name «${name}».`);
@@ -937,6 +956,78 @@ export class MemoryService {
 		const commits = (await this.store.fileLog(path, limit)).map(({ commit, date, author, email, message, trailers }) => ({ commit, date, author, email, message, trailers }));
 		if (commits.length === 0) throw new MemoryError("NOT_FOUND", `No history for «${path}».`);
 		return { path, commits };
+	}
+
+	/**
+	 * Picks up a topic where another agent left it, in one call: the topic's note, its state sections whole (the
+	 * headings in `[resume] sections`), the latest changes to it (when, who, why) and the other headings, so the
+	 * caller reads only what it needs. `topic` is a note's name or path, or words to search for. With `since` (the
+	 * caller's last visit), only the changes after it, and whether there are any.
+	 */
+	async resume(args: { topic: string; since?: string }): Promise<ResumeResult> {
+		const topic = args.topic?.trim();
+		if (!topic) throw new MemoryError("INVALID_ARGUMENT", "«topic» is required: a note's name or path, or words about the topic.");
+		let row: NoteRow | null = null;
+		let candidates: { path: string; description: string | null }[] = [];
+		const asRef = /\.md$|\//.test(topic) ? { path: topic } : /^[\p{Ll}\p{N}-]+$/u.test(topic) ? { name: topic } : null;
+		if (asRef) {
+			try {
+				row = this.resolveNote(asRef);
+			} catch {}
+		}
+		if (!row) {
+			const { hits } = await this.searchAny({ query: topic, limit: 10 });
+			const paths = [...new Set(hits.map((h) => h.path))];
+			if (paths.length === 0) throw new MemoryError("NOT_FOUND", `Nothing in the memory about «${topic}».`, { suggestions: this.suggestions(topic) });
+			row = this.index.getNote(paths[0] as string);
+			if (!row) throw new MemoryError("NOT_FOUND", `Nothing in the memory about «${topic}».`);
+			candidates = paths.slice(1, 4).map((p) => ({ path: p, description: this.index.getNote(p)?.description ?? null }));
+		}
+		const content = await this.readText(row.path);
+		const parsed = parseNote(content, this.conventions);
+		const title = parsed.meta.title ?? firstH1(parsed.body) ?? noteName(row.path);
+		const sections = splitSections(parsed.body, parsed.bodyLine, title);
+		const wanted = new Set(this.conventions.resume.sections.map((h) => normalizeWords(h)));
+		const state: { heading: string; text: string }[] = [];
+		let inside = false;
+		for (const s of sections) {
+			if (s.level === 2 || s === sections[0]) inside = wanted.has(normalizeWords(s.heading));
+			else if (s.level === 3 && wanted.has(normalizeWords(s.heading))) inside = true;
+			if (inside && s !== sections[0]) state.push({ heading: s.heading, text: s.text.trim() });
+		}
+		let budget = this.conventions.resume.maxChars;
+		let truncated = false;
+		for (const s of state) {
+			if (s.text.length > budget) {
+				s.text = `${s.text.slice(0, Math.max(budget, 0))}…`;
+				truncated = true;
+			}
+			budget -= s.text.length;
+		}
+		const intro = sections[0]?.text.replace(/^#\s.*\n/, "").trim() ?? "";
+		const since = args.since?.trim() ? parseSince(args.since) : null;
+		const log = await this.store.fileLog(row.path, since ? 50 : 5);
+		const changes = log
+			.filter((c) => !since || Date.parse(c.date) > Date.parse(since))
+			.slice(0, since ? 20 : 5)
+			.map((c) => ({ date: c.date, by: c.author, why: c.message.split("\n")[0] as string }));
+		const shown = new Set(state.map((s) => s.heading));
+		return {
+			path: row.path,
+			name: noteName(row.path),
+			description: row.description,
+			hash: blobHash(content),
+			updated_at: row.updatedAt,
+			updated_by: row.updatedBy,
+			...(state.length
+				? { state }
+				: { intro: intro.length > 1500 ? `${intro.slice(0, 1500)}…` : intro, note: `No state sections yet (${this.conventions.resume.sections.join(", ")}): add them as you work, so the next agent can resume from them.` }),
+			...(truncated ? { truncated: true } : {}),
+			other_sections: sections.slice(1).filter((s) => !shown.has(s.heading)).map((s) => s.heading),
+			...(since ? { since, changed: changes.length > 0 } : {}),
+			changes,
+			...(candidates.length ? { other_candidates: candidates } : {}),
+		};
 	}
 
 	/**
