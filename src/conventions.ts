@@ -34,6 +34,12 @@ export interface Conventions {
 		/** Relation keys agents may use in `key:: [[x]]`, lowercase; `null` means any. */
 		allowed: string[] | null;
 	};
+	resume: {
+		/** Headings of a note's state sections (what is going on, what comes next), returned whole by `resume`. */
+		sections: string[];
+		/** At most this many characters of state sections in one answer. */
+		maxChars: number;
+	};
 	lint: {
 		/** Folders left out of every lint check (the archive and root files always are). */
 		exclude: string[];
@@ -68,6 +74,7 @@ export function defaultConventions(): Conventions {
 		instructions: { file: "AGENTS.md" },
 		attachments: { pageHeading: "Page {n}", ocrNotice: "Text recognised with OCR ({languages}); it may contain errors." },
 		relations: { allowed: null },
+		resume: { sections: ["Status", "In progress", "Next steps", "Open questions"], maxChars: 6000 },
 		lint: { exclude: [], orphanExclude: [], staleDays: 180, inferenceDays: 90, inferredMarkers: ["deducido"], maxBytes: 16_384, missingPageMin: 2, mentionMinLength: 4 },
 	};
 }
@@ -138,6 +145,13 @@ export function parseConventions(text: string): Conventions {
 
 	const relations = table(doc.relations, "relations");
 	if (relations.allowed !== undefined) c.relations.allowed = stringList(relations.allowed, "relations.allowed", (v) => RELATION_KEY.test(v)).map((v) => v.toLowerCase());
+
+	const resume = table(doc.resume, "resume");
+	if (resume.sections !== undefined) c.resume.sections = stringList(resume.sections, "resume.sections", (v) => v.trim() !== "");
+	if (resume.max_chars !== undefined) {
+		if (typeof resume.max_chars !== "number" || !Number.isInteger(resume.max_chars) || resume.max_chars < 500) throw new Error("resume.max_chars must be an integer >= 500");
+		c.resume.maxChars = resume.max_chars;
+	}
 
 	const lint = table(doc.lint, "lint");
 	if (lint.exclude !== undefined) c.lint.exclude = stringList(lint.exclude, "lint.exclude", (v) => FOLDER.test(v));

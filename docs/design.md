@@ -32,6 +32,33 @@ How my-memory works inside, for people who want to run it, change it or build so
 - **Stack:** TypeScript on Node.js 24; the official `@modelcontextprotocol/sdk` for the Streamable HTTP transport and the OAuth helpers; express; the built-in `node:sqlite` (FTS5, WAL); the `git`, `git-lfs`, `pdftotext`, `pdftoppm` and `tesseract` binaries called with `execFile`, never through a shell.
 - **Two listeners.** The listener a request arrives on decides which credentials it accepts, without trusting proxy headers. The public one, meant to sit behind a reverse proxy, accepts only OAuth access tokens, so a leaked static token is useless from the internet; it has no uploads or webhook. Both listeners are optional: a setup with only local clients runs the private one alone.
 
+## Where the notes live
+
+The memory talks to its notes through a small interface (`NoteStore` in `src/store.ts`): the files of HEAD in a local folder, commit, fetch, history, revert. Two implementations:
+
+- **`GitStore`**, the self-hosted default: a working clone driven by the `git` binary, pushed to any git remote, with LFS for attachments. A write commits locally and pushes; pushes from elsewhere are integrated by rebase.
+- **`GitHubStore`**, for hosts without a disk or a git binary (Vercel): the files of HEAD come from one tarball download into `/tmp`; a write builds blobs, a tree and a commit with GitHub's Git Data API and moves the branch **without force**. If the branch moved meanwhile, the remote commits are fetched: when they touched other files, the write is rebased on top and retried; when they touched the same file, the remote wins (`StoreConflictError`, which the tools report as `REMOTE_CONFLICT` with the note as it is now). History, `recent` and `revert` read GitHub's commits API; reverts merge with `node-diff3`. Every commit is published as it is made, so there is never anything local to lose.
+
+The index is the same in both: SQLite, rebuilt from the files when it is missing.
+
+## Files and sources
+
+With `[drive]` (or the `GOOGLE_*` variables), the server also serves the user's Google Drive:
+
+- **`DriveFiles`** lists My Drive once (id, name, parents, type, size, md5, date) and keeps it current with Drive's changes feed; paths are computed from the parents. A Drive of more than one page is listed by spans of modification time, side by side (16 requests at a time): a span with more than a page is cut in half until each half fits, so 54 000 files take about 40 s instead of 4½ minutes in one paged list. The changes feed comes 50 at a time; after 40 pages (a burst: Google once logged 51 000 changes to one Drive in a second) it is faster to list again, and that is what it does. Name search runs over that list in memory (every word in the name or the path, accents ignored; name matches first, then the most recent). Content search is Drive's own `fullText contains`, which covers PDFs, Office files and OCR'd images without downloading anything. A gzipped snapshot of the list, with the changes token, is kept in the app's hidden folder (`appDataFolder`), so a cold start reads one file and applies the changes since.
+- **The sources folder** is a Drive folder (by path or id). Its documents are identified by their Drive file id, which survives renames, moves and new versions; notes cite them as `source:<id>` and `files_info` / `files_read` take that id. `.my-memory/sources.json` in the notes repo records, per document, the version (md5, or the modification time for Google's formats) the memory integrated and what happened; dot-folders are invisible to the tools and the index.
+- **`Ingester`** compares the folder with that state and hands each new, changed or removed document to the configured agent, a few per run, saving the state after each one (a run cut short loses at most the document it was on). Failures are retried 3 times per version, then once a day (the provider or the configuration may have been fixed). On hosts that run several copies at once, a run first commits a lease into the same file; since the store refuses a second commit on top of a file someone else just changed, only one copy ingests.
+- **The agents** get the memory's own instructions (`AGENTS.md` and the short index) as the system prompt, a brief saying what to do with this document and how to cite it, the document (text; PDFs and images as content blocks for Claude; a PDF's text, read with pdf.js, for models or APIs that take no PDFs), and the memory tools (`search`, `list`, `read`, `links`, `create`, `edit`, `write`) run in-process as the client `ingest`, so every change is a normal attributed commit. `anthropic` is a tool loop over the Messages API that sends the whole conversation every turn (no server-side state, so any Anthropic-compatible API works: Command Code, a proxy, Bedrock's gateway…; extended thinking only on Anthropic's own API unless `thinking` says otherwise); `openai` is a function-calling loop over any compatible chat completions API; `webhook` hands the document's id and the brief to another program, which writes through MCP like any client.
+- **Triggers** all run the same idempotent pass: Drive's push notices (`/hooks/drive`, a channel opened with `changes.watch` and renewed before its one-week expiry), a timer on a long-lived server, and `/cron/ingest` on a serverless one.
+
+## Resuming a topic
+
+`resume` is a read made for handing a topic from one agent to another cheaply. It resolves the topic (a name, a path, or the best search hit, with the runners-up), and returns the note's description, the sections named in `[resume] sections` whole (with their subsections), only the headings of the rest, and the latest commits to the note (date, author, reason), or only those after `since`. Its description asks agents to keep those sections current as they work; that, not a summary written at the end, is what lets the next agent continue.
+
+## Serverless
+
+`src/vercel.ts` builds the same Express app as the private listener, with `GitHubStore`, the configuration from environment variables, static tokens from `MEMORY_TOKENS` and the token also accepted in the path (`/t/<token>/mcp`) for clients that take only a URL. One instance serves many requests: it syncs with GitHub before a request when the last sync is more than 5 s old (one ref lookup; the files that changed are fetched one by one). Work after the answer (Drive's notices) goes to `waitUntil`. See [deploy-vercel.md](deploy-vercel.md).
+
 ## Notes
 
 A notes repo is plain Markdown with YAML frontmatter:

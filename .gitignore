@@ -3,3 +3,8 @@ dist/
 coverage/
 result
 *.log
+public/
+.vercel/
+
+.vercel
+.env*
