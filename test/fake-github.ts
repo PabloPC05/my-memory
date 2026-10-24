@@ -90,7 +90,7 @@ export async function fakeGitHub(bare: string, owner = "alex", repo = "memoria",
 		if (method === "GET" && (m = /^\/tarball\/(.+)$/.exec(rest))) {
 			const sha = await resolve(m[1] as string);
 			if (!sha) return send(res, 404, { message: "Not Found" });
-			const tgz = gzipSync(await git.bytes(["archive", "--format=tar", `--prefix=${owner}-${repo}-${sha.slice(0, 7)}/`, sha]));
+			const tgz = gzipSync(await git.bytes(["-c", "core.autocrlf=false", "archive", "--format=tar", `--prefix=${owner}-${repo}-${sha.slice(0, 7)}/`, sha]));
 			return send(res, 200, tgz, "application/x-gzip");
 		}
 		if (method === "GET" && (m = /^\/git\/commits\/([0-9a-f]{40})$/.exec(rest))) {

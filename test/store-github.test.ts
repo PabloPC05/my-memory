@@ -71,7 +71,7 @@ describe("tar reader", () => {
 			const long = `temas/${"una-nota-con-un-nombre-muy-largo-".repeat(5)}fin.md`;
 			const bare = await seedRemote(root, { "a.md": "A\n", [long]: "largo\n", "dir/b.bin": "\u0000\u0001binario" });
 			const { gzipSync } = await import("node:zlib");
-			const tgz = gzipSync(await new Git(bare).bytes(["archive", "--format=tar", "--prefix=alex-memoria-abc/", "main"]));
+			const tgz = gzipSync(await new Git(bare).bytes(["-c", "core.autocrlf=false", "archive", "--format=tar", "--prefix=alex-memoria-abc/", "main"]));
 			const files = readTarGz(tgz, 1);
 			expect(files.map((f) => f.path).sort()).toEqual(["a.md", "dir/b.bin", long].sort());
 			expect(files.find((f) => f.path === long)?.data.toString()).toBe("largo\n");
@@ -117,7 +117,7 @@ describe("GitHubStore", () => {
 		const moved = await env.memory.move(writer, { from: "universidad", to: "temas/carrera.md", hash, reason: "Renombro" });
 		expect(moved.links_rewritten).toBe(2);
 		const files = (await remoteGit(env).out(["show", "--name-status", "--format=", "main"])).trim().split("\n");
-		expect(files.length).toBe(4); // the move (delete + add) and the two notes that linked to it
+		expect(files.length).toBe(3); // the move (one rename) and the two notes that linked to it
 		expect(await remoteGit(env).out(["show", "main:temas/piso.md"])).toContain("[[carrera]]");
 		expect(env.memory.search({ query: "estadistica" }).hits[0]?.path).toBe("temas/carrera.md");
 
