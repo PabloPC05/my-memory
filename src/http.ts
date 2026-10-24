@@ -75,7 +75,7 @@ function errorHandler(log: Logger) {
  * Public listener (behind the public reverse proxy): OAuth endpoints and MCP with OAuth access tokens only.
  * Static tokens are never accepted here, so a leaked one is useless from the internet.
  */
-export function publicApp(opts: { memory: MemoryService; oauth: ForgejoOAuthProvider; publicUrl: string; log: Logger; clients?: ClientsService | null }): express.Express {
+export function publicApp(opts: { memory: MemoryService; oauth: ForgejoOAuthProvider; publicUrl: string; log: Logger; clients?: ClientsService | null; routes?: express.Router | null }): express.Express {
 	const app = express();
 	app.disable("x-powered-by");
 	app.set("trust proxy", "loopback");
@@ -96,6 +96,7 @@ export function publicApp(opts: { memory: MemoryService; oauth: ForgejoOAuthProv
 	);
 	app.get("/oauth/callback", asyncRoute(opts.oauth.callback));
 	app.all("/mcp", requireBearerAuth({ verifier: opts.oauth, resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resource) }), express.json({ limit: "64mb" }), asyncRoute(mcpHandler(opts.memory, opts.log, opts.clients ?? null)));
+	if (opts.routes) app.use(opts.routes);
 	app.use((_req, res) => {
 		res.status(404).json({ error: "not_found" });
 	});
@@ -106,7 +107,7 @@ export function publicApp(opts: { memory: MemoryService; oauth: ForgejoOAuthProv
 /**
  * Private listener (tailnet only): MCP with static tokens (or OAuth ones), uploads and the Forgejo webhook.
  */
-export function privateApp(opts: { memory: MemoryService; tokens: TokenStore; oauth?: ForgejoOAuthProvider | null; uploads: UploadStore; webhookSecret?: string | null; log: Logger; clients?: ClientsService | null }): express.Express {
+export function privateApp(opts: { memory: MemoryService; tokens: TokenStore; oauth?: ForgejoOAuthProvider | null; uploads: UploadStore; webhookSecret?: string | null; log: Logger; clients?: ClientsService | null; routes?: express.Router | null }): express.Express {
 	const app = express();
 	app.disable("x-powered-by");
 
@@ -180,6 +181,7 @@ export function privateApp(opts: { memory: MemoryService; tokens: TokenStore; oa
 	);
 
 	app.all("/mcp", authenticated, express.json({ limit: "512mb" }), asyncRoute(mcpHandler(opts.memory, opts.log, opts.clients ?? null)));
+	if (opts.routes) app.use(opts.routes);
 	app.use((_req, res) => {
 		res.status(404).json({ error: "not_found" });
 	});

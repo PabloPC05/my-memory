@@ -5,6 +5,7 @@ import { TokenStore } from "./auth/tokens.js";
 import { buildClientsReport, ClientActivity, type ClientsService } from "./clients.js";
 import type { ServerConfig } from "./config.js";
 import { privateApp, publicApp } from "./http.js";
+import { Integrations } from "./integrations.js";
 import { jsonLogger, type Logger } from "./log.js";
 import { MemoryService } from "./memory.js";
 import { detectOcr } from "./ocr.js";
@@ -45,6 +46,19 @@ export async function startServer(config: ServerConfig, log: Logger = jsonLogger
 		embeddings: config.embeddings,
 	});
 	await memory.start();
+	let integrations: Integrations | null = null;
+	if (config.files) {
+		integrations = new Integrations(memory, config.files, config.ingest, { log });
+		memory.files = integrations.files;
+		try {
+			await integrations.start();
+		} catch (error) {
+			// The memory works without its files; the timer retries.
+			log("error", "files.start_failed", { error: String(error) });
+		}
+		integrations.startTimer(config.files.checkIntervalSeconds);
+	}
+	const routes = integrations?.routes({}) ?? null;
 	const tokens = new TokenStore(config.tokensFile);
 	const oauth =
 		config.oauth && config.publicUrl
@@ -72,10 +86,10 @@ export async function startServer(config: ServerConfig, log: Logger = jsonLogger
 	flushActivity.unref();
 	const servers: Server[] = [];
 	if (config.listen.public && oauth && config.publicUrl) {
-		servers.push(await listen(publicApp({ memory, oauth, publicUrl: config.publicUrl, log, clients }), config.listen.public.address, config.listen.public.port));
+		servers.push(await listen(publicApp({ memory, oauth, publicUrl: config.publicUrl, log, clients, routes }), config.listen.public.address, config.listen.public.port));
 	}
 	if (config.listen.private) {
-		servers.push(await listen(privateApp({ memory, tokens, oauth, uploads, webhookSecret: config.webhookSecret, log, clients }), config.listen.private.address, config.listen.private.port));
+		servers.push(await listen(privateApp({ memory, tokens, oauth, uploads, webhookSecret: config.webhookSecret, log, clients, routes }), config.listen.private.address, config.listen.private.port));
 	}
 	const sweep = setInterval(() => uploads.sweep().catch(() => undefined), 60 * 60 * 1000);
 	sweep.unref();
@@ -85,6 +99,7 @@ export async function startServer(config: ServerConfig, log: Logger = jsonLogger
 		tokens: tokens.count,
 		oauth: Boolean(oauth),
 		embeddings: config.embeddings ? config.embeddings.model : null,
+		files: config.files ? { sources: config.files.sourcesFolder, push: Boolean(config.files.push), ingest: config.ingest?.provider ?? null } : null,
 	});
 	return {
 		memory,
@@ -93,6 +108,7 @@ export async function startServer(config: ServerConfig, log: Logger = jsonLogger
 		servers,
 		stop: async () => {
 			clearInterval(sweep);
+			integrations?.stop();
 			clearInterval(flushActivity);
 			await Promise.all(servers.map((s) => new Promise<void>((r) => s.close(() => r()))));
 			await memory.stop();

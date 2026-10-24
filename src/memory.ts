@@ -143,7 +143,7 @@ export class MemoryService {
 	/** Background embedding of sections; null when `[embeddings]` is not configured. */
 	readonly embedder: Embedder | null = null;
 	/** The user's files (Google Drive), when configured. */
-	readonly files: DriveFiles | null;
+	files: DriveFiles | null;
 
 	constructor(readonly opts: MemoryOptions) {
 		this.log = opts.log ?? silentLogger;

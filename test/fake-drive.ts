@@ -16,6 +16,7 @@ export interface FakeDrive {
 	url: string;
 	tokenUrl: string;
 	calls: string[];
+	channels: { id: string; address: string; token: string; stopped: boolean }[];
 	add: (f: FakeFile) => void;
 	update: (id: string, patch: Partial<FakeFile>) => void;
 	remove: (id: string) => void;
@@ -31,6 +32,7 @@ export async function fakeDrive(initial: FakeFile[] = []): Promise<FakeDrive> {
 	const appdata = new Map<string, { name: string; content: Buffer }>();
 	const changes: { fileId: string; removed: boolean }[] = [];
 	const calls: string[] = [];
+	const channels: FakeDrive["channels"] = [];
 	for (const f of initial) files.set(f.id, { modifiedTime: now(), ...f });
 
 	const api = (f: FakeFile) => ({ id: f.id, name: f.name, mimeType: f.mimeType, parents: f.parents, modifiedTime: f.modifiedTime, size: f.content ? String(f.content.length) : undefined, trashed: f.trashed ?? false });
@@ -84,6 +86,16 @@ export async function fakeDrive(initial: FakeFile[] = []): Promise<FakeDrive> {
 			const f = files.get(m[1] as string);
 			return f?.content ? send(res, 200, f.content) : send(res, 404, { error: "not found" });
 		}
+		if (req.method === "POST" && p === "/drive/v3/changes/watch") {
+			const b = JSON.parse((await body(req)).toString()) as { id: string; address: string; token: string; expiration: number };
+			channels.push({ id: b.id, address: b.address, token: b.token, stopped: false });
+			return send(res, 200, { kind: "api#channel", id: b.id, resourceId: `res-${b.id}`, expiration: String(b.expiration) });
+		}
+		if (req.method === "POST" && p === "/drive/v3/channels/stop") {
+			const b = JSON.parse((await body(req)).toString()) as { id: string };
+			for (const c of channels) if (c.id === b.id) c.stopped = true;
+			return send(res, 204, Buffer.alloc(0));
+		}
 		if (req.method === "PATCH" && (m = /^\/upload\/drive\/v3\/files\/([^/]+)$/.exec(p))) {
 			const a = appdata.get(m[1] as string);
 			if (!a) return send(res, 404, { error: "not found" });
@@ -109,6 +121,7 @@ export async function fakeDrive(initial: FakeFile[] = []): Promise<FakeDrive> {
 		url: base,
 		tokenUrl: `${base}/token`,
 		calls,
+		channels,
 		add: (f) => {
 			files.set(f.id, { modifiedTime: now(), ...f });
 			changes.push({ fileId: f.id, removed: false });

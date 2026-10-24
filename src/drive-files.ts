@@ -97,6 +97,11 @@ export class DriveFiles {
 		this.listeners.add(fn);
 	}
 
+	/** Drive's changes token the index is at (for opening a push channel from the same point). */
+	get changesToken(): string | null {
+		return this.pageToken;
+	}
+
 	get size(): number {
 		return this.files.size;
 	}

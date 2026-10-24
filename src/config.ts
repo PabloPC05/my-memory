@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import type { EmbeddingsConfig } from "./embeddings.js";
+import type { IngestConfig } from "./ingest.js";
+import type { FilesConfig } from "./integrations.js";
 import type { Level } from "./log.js";
 import { defaultOcrSettings, type OcrSettings } from "./ocr.js";
 
@@ -34,6 +36,10 @@ export interface ServerConfig {
 	pdftotext: string;
 	ocr: OcrSettings;
 	logLevel: Level;
+	/** The user's Google Drive as files (and the sources folder), or null. */
+	files: (FilesConfig & { checkIntervalSeconds: number }) | null;
+	/** The agent that ingests the sources folder, or null. */
+	ingest: IngestConfig | null;
 }
 
 /**
@@ -86,6 +92,41 @@ function embeddings(t: Record<string, unknown> | undefined, base: string, read: 
 		timeoutSeconds: num(t.timeout_seconds, "embeddings.timeout_seconds", 60, 1),
 		queryPrefix: t.query_prefix === undefined ? "" : String(t.query_prefix),
 		documentPrefix: t.document_prefix === undefined ? "" : String(t.document_prefix),
+	};
+}
+
+function files(t: Record<string, unknown> | undefined, base: string, read: boolean, publicUrl: string | null): ServerConfig["files"] {
+	if (!t) return null;
+	const pushToken = readSecret(t.push_token_file, "drive.push_token_file", base, read);
+	if (pushToken && !publicUrl) throw new Error("drive.push_token_file needs public_url: Drive sends its notices to <public_url>/hooks/drive");
+	return {
+		drive: {
+			clientId: str(t.client_id, "drive.client_id"),
+			clientSecret: readSecret(t.client_secret_file, "drive.client_secret_file", base, read) ?? str(undefined, "drive.client_secret_file"),
+			refreshToken: readSecret(t.refresh_token_file, "drive.refresh_token_file", base, read) ?? str(undefined, "drive.refresh_token_file"),
+		},
+		sourcesFolder: t.sources_folder === undefined ? null : str(t.sources_folder, "drive.sources_folder"),
+		snapshot: t.snapshot === undefined ? true : Boolean(t.snapshot),
+		push: pushToken && publicUrl ? { address: `${publicUrl}/hooks/drive`, token: pushToken } : null,
+		checkIntervalSeconds: Math.floor(num(t.check_interval_seconds, "drive.check_interval_seconds", 60, 10)),
+	};
+}
+
+function ingest(t: Record<string, unknown> | undefined, base: string, read: boolean): IngestConfig | null {
+	if (!t) return null;
+	const provider = str(t.provider, "ingest.provider");
+	if (provider !== "anthropic" && provider !== "openai" && provider !== "webhook") throw new Error("ingest.provider must be anthropic, openai or webhook");
+	const opt = (v: unknown, key: string) => (v === undefined ? undefined : str(v, key));
+	return {
+		provider,
+		model: opt(t.model, "ingest.model"),
+		apiKey: readSecret(t.api_key_file, "ingest.api_key_file", base, read) ?? undefined,
+		baseUrl: opt(t.base_url, "ingest.base_url"),
+		webhookUrl: opt(t.webhook_url, "ingest.webhook_url"),
+		webhookSecret: readSecret(t.webhook_secret_file, "ingest.webhook_secret_file", base, read) ?? undefined,
+		maxFilesPerRun: t.max_files_per_run === undefined ? undefined : positiveInt(t.max_files_per_run, "ingest.max_files_per_run", 3),
+		maxSteps: t.max_steps === undefined ? undefined : positiveInt(t.max_steps, "ingest.max_steps", 30),
+		maxChars: t.max_chars === undefined ? undefined : positiveInt(t.max_chars, "ingest.max_chars", 200_000),
 	};
 }
 
@@ -162,7 +203,11 @@ export function loadConfig(file: string, opts: { secrets?: boolean } = {}): Serv
 		pdftotext: str(doc.pdftotext, "pdftotext", "pdftotext"),
 		ocr: ocrSettings(doc.ocr),
 		logLevel: (["debug", "info", "warn", "error"].includes(doc.log_level as string) ? doc.log_level : "info") as Level,
+		files: null,
+		ingest: ingest(doc.ingest as Record<string, unknown> | undefined, base, read),
 	};
+	config.files = files(doc.drive as Record<string, unknown> | undefined, base, read, config.publicUrl);
+	if (config.ingest && !config.files?.sourcesFolder) throw new Error("[ingest] needs [drive] with sources_folder");
 	if (config.listen.public) {
 		if (!config.oauth) throw new Error("listen.public needs [oauth]: only OAuth tokens are accepted on the public listener");
 		if (!config.publicUrl) throw new Error("listen.public needs public_url");
