@@ -96,7 +96,7 @@ describe("private listener", () => {
 		const client = await mcp(priv.url, writeToken, "chat-7");
 		expect(client.getInstructions()).toContain("[[perfil]]");
 		const tools = (await client.listTools()).tools.map((t) => t.name).sort();
-		expect(tools).toEqual(["attach", "create", "delete", "edit", "history", "links", "lint", "list", "move", "read", "recent", "revert", "search", "write"]);
+		expect(tools).toEqual(["attach", "create", "delete", "edit", "history", "links", "lint", "list", "move", "read", "recent", "resume", "revert", "search", "write"]);
 		const created = parse(await client.callTool({ name: "create", arguments: { path: "personas/sara.md", content: note("Sara", "Amiga", "Le gusta el té."), reason: "Nueva" } }));
 		expect(created.commit).toBeTruthy();
 		const hist = parse(await client.callTool({ name: "history", arguments: { name: "sara" } })) as { commits: { author: string; trailers: Record<string, string> }[] };
@@ -114,7 +114,7 @@ describe("private listener", () => {
 	it("gives read-only tokens only the read tools", async () => {
 		const client = await mcp(priv.url, readToken);
 		const tools = (await client.listTools()).tools.map((t) => t.name).sort();
-		expect(tools).toEqual(["history", "links", "lint", "list", "read", "recent", "search"]);
+		expect(tools).toEqual(["history", "links", "lint", "list", "read", "recent", "resume", "search"]);
 		const hits = parse(await client.callTool({ name: "search", arguments: { query: "café" } })) as { hits: { path: string }[] };
 		expect(hits.hits[0]?.path).toBe("yo/perfil.md");
 		const lint = parse(await client.callTool({ name: "lint", arguments: { kinds: ["stale", "oversized"] } }));
@@ -241,7 +241,7 @@ describe("public listener and OAuth", () => {
 		const back3 = await authorize(clientId);
 		const t3 = (await (await token({ grant_type: "authorization_code", client_id: clientId, code: back3.searchParams.get("code") as string, code_verifier: verifier, redirect_uri: redirectUri })).json()) as { access_token: string };
 		const viaPrivate = await mcp(priv.url, t3.access_token);
-		expect((await viaPrivate.listTools()).tools.length).toBe(14);
+		expect((await viaPrivate.listTools()).tools.length).toBe(15);
 		await viaPrivate.close();
 		expect(oauth.revokeClient(clientId)).toBeGreaterThan(0);
 		await expect(oauth.verifyAccessToken(t3.access_token)).rejects.toThrow();

@@ -259,7 +259,7 @@ export class Ingester {
 		private readonly sources: DriveSources,
 		private readonly agent: IngestAgent,
 		private readonly config: IngestConfig,
-		private readonly opts: { log?: Logger; lease?: boolean } = {},
+		private readonly opts: { log?: Logger; lease?: boolean; budgetMs?: number } = {},
 	) {
 		this.log = opts.log ?? silentLogger;
 	}
@@ -272,6 +272,7 @@ export class Ingester {
 	async run(trigger: string): Promise<IngestReport> {
 		if (this.running) return { skipped: "running", done: [], failed: [], remaining: 0 };
 		this.running = true;
+		const started = Date.now();
 		try {
 			// Several copies share the state only through the remote: start from its latest version.
 			if (this.opts.lease) await this.memory.sync("ingest");
@@ -284,9 +285,16 @@ export class Ingester {
 			if (this.opts.lease && !(await this.takeLease(state))) return { ...report, skipped: "running", remaining: tasks.length };
 			for (const [i, task] of batch.entries()) {
 				await this.handleOne(task, state, report, trigger);
-				if (i === batch.length - 1) delete state.lease;
+				// On a host with a time limit, stop starting sources once most of it is spent; the rest wait for the next run.
+				const outOfTime = this.opts.budgetMs !== undefined && Date.now() - started > this.opts.budgetMs;
+				const last = i === batch.length - 1 || outOfTime;
+				if (last) delete state.lease;
 				const reason = `Ingestion: ${task.kind} «${task.name}»${report.failed.some((f) => f.id === task.id) ? " (failed)" : ""}`;
 				await this.memory.saveState(STATE_CLIENT, "sources", state, reason);
+				if (last) {
+					report.remaining += batch.length - 1 - i;
+					break;
+				}
 			}
 			return report;
 		} finally {

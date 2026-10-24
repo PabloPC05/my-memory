@@ -31,17 +31,43 @@ function parseTokens(text: string): StaticToken[] {
 	});
 }
 
-/** Static Bearer tokens, one per client, read from a TOML file. Reloaded on SIGHUP. */
+/**
+ * Tokens given in one string, for hosts configured through environment variables: one per line (or separated by
+ * commas), `id:scope:secret` or `id:scope:secret:Name`, where secret is the token itself or its `sha256:<hex>`.
+ */
+export function parseTokenList(text: string): StaticToken[] {
+	const seen = new Set<string>();
+	return text
+		.split(/[\n,]/)
+		.map((l) => l.trim())
+		.filter(Boolean)
+		.map((line) => {
+			const [id, scope, secret, ...name] = line.split(":");
+			const hashed = secret === "sha256";
+			const value = hashed ? `sha256:${name.shift() ?? ""}` : (secret ?? "");
+			if (!id || !ID.test(id)) throw new Error(`token list: invalid id in «${id ?? ""}:…»`);
+			if (seen.has(id)) throw new Error(`token list: duplicate id «${id}»`);
+			seen.add(id);
+			if (scope !== "read" && scope !== "write") throw new Error(`token list: «${id}» scope must be read or write`);
+			if (hashed ? !/^sha256:[0-9a-f]{64}$/.test(value) : value.length < 20) throw new Error(`token list: «${id}» needs a token of at least 20 characters (or its sha256:<hex>)`);
+			return { id, name: name.join(":").trim() || id, scope, hash: hashed ? value : `sha256:${sha256(value)}` };
+		});
+}
+
+/** Static Bearer tokens, one per client, read from a TOML file (reloaded on SIGHUP) or given as a list. */
 export class TokenStore {
 	private tokens: StaticToken[] = [];
 
-	constructor(readonly file: string | null) {
+	constructor(
+		readonly file: string | null,
+		private readonly fixed: StaticToken[] = [],
+	) {
 		this.reload();
 	}
 
 	reload(): void {
 		if (!this.file || !existsSync(this.file)) {
-			this.tokens = [];
+			this.tokens = [...this.fixed];
 			return;
 		}
 		this.tokens = parseTokens(readFileSync(this.file, "utf8"));

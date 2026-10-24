@@ -1004,7 +1004,9 @@ export class MemoryService {
 			}
 			budget -= s.text.length;
 		}
-		const intro = sections[0]?.text.replace(/^#\s.*\n/, "").trim() ?? "";
+		// The text before the first section, or else the first section: enough to know what the note is about.
+		const first = sections[1] ? `## ${sections[1].heading}\n${sections[1].text.replace(/^#+\s.*\n/, "")}`.trim() : "";
+		const intro = sections[0]?.text.replace(/^#\s.*\n/, "").trim() || first;
 		const since = args.since?.trim() ? parseSince(args.since) : null;
 		const log = await this.store.fileLog(row.path, since ? 50 : 5);
 		const changes = log

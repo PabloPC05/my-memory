@@ -126,6 +126,15 @@ describe("ingestion of the sources folder", () => {
 		}
 	});
 
+	it("with a time budget, stops starting sources once it is spent and counts the rest", async () => {
+		const { memory, files, sources, drive } = await setup();
+		for (const n of [1, 2, 3]) drive.add({ id: `t${n}`, name: `T${n}.txt`, mimeType: "text/plain", parents: ["fuentes"], content: Buffer.from(String(n)) });
+		const ingester = new Ingester(memory, files, sources, { name: "noop", handle: async () => ({ summary: "", notes: [] }) }, { provider: "webhook" }, { budgetMs: 0 });
+		const r = await ingester.run("test");
+		expect([r.done.length, r.remaining]).toEqual([1, 2]);
+		expect((await ingester.run("test")).done).toHaveLength(1);
+	});
+
 	it("tells the agent what to do and how to cite", () => {
 		const brief = ingestBrief({ kind: "changed", id: "abc", name: "Contrato.pdf", path: "Memoria/Fuentes/Contrato.pdf", version: "1", mimeType: "application/pdf", previous: null });
 		expect(brief).toContain("source:abc");

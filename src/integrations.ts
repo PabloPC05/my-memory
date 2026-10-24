@@ -52,13 +52,13 @@ export class Integrations {
 		private readonly memory: MemoryService,
 		private readonly config: FilesConfig,
 		ingest: IngestConfig | null,
-		opts: { log?: Logger; lease?: boolean; agent?: IngestAgent } = {},
+		opts: { log?: Logger; lease?: boolean; budgetMs?: number; agent?: IngestAgent } = {},
 	) {
 		this.log = opts.log ?? silentLogger;
 		this.files = new DriveFiles(new DriveClient(config.drive), { log: this.log, snapshot: config.snapshot });
 		const sources = config.sourcesFolder ? new DriveSources(this.files, config.sourcesFolder) : null;
 		const agent = opts.agent ?? (ingest ? createIngestAgent(memory, ingest) : null);
-		this.ingester = sources && agent && ingest ? new Ingester(memory, this.files, sources, agent, ingest, { log: this.log, lease: opts.lease }) : null;
+		this.ingester = sources && agent && ingest ? new Ingester(memory, this.files, sources, agent, ingest, { log: this.log, lease: opts.lease, budgetMs: opts.budgetMs }) : null;
 	}
 
 	async start(): Promise<void> {
@@ -122,8 +122,12 @@ export class Integrations {
 	 * check, with `Authorization: Bearer <cronSecret>`, as Vercel Cron sends it). `background` keeps work going after
 	 * the answer (Vercel's waitUntil); without it, the pass runs before answering.
 	 */
-	routes(opts: { cronSecret?: string | null; background?: (work: Promise<unknown>) => void }): express.Router {
+	routes(opts: { cronSecret?: string | null; background?: (work: Promise<unknown>) => void; more?: () => Promise<unknown> }): express.Router {
 		const router = express.Router();
+		// When a pass leaves sources for later (a time limit), `more` starts another one (on Vercel, a new invocation).
+		const andMore = async (report: IngestReport | null) => {
+			if (report && report.remaining > 0 && !report.skipped && opts.more) await opts.more();
+		};
 		const run = (work: () => Promise<unknown>, what: string) => {
 			const p = work().catch((error) => this.log("warn", `${what}.failed`, { error: String(error) }));
 			if (opts.background) opts.background(p);
@@ -141,7 +145,7 @@ export class Integrations {
 				res.status(204).end(); // the channel's first message: nothing changed yet
 				return;
 			}
-			const work = run(() => this.pass("drive-push"), "drive.push");
+			const work = run(async () => andMore(await this.pass("drive-push")), "drive.push");
 			if (!opts.background) await work;
 			res.status(204).end();
 		});
@@ -151,7 +155,9 @@ export class Integrations {
 				res.status(opts.cronSecret ? 401 : 404).end();
 				return;
 			}
-			res.json(await this.check("cron"));
+			const result = await this.check("cron");
+			run(() => andMore(result.ingest), "ingest.more");
+			res.json(result);
 		});
 		return router;
 	}

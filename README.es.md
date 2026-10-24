@@ -14,6 +14,10 @@ Una memoria autoalojada para agentes de IA. Tus notas son una carpeta de Markdow
 - **Adjuntos.** Los binarios van a git LFS con una nota al lado que contiene su texto (los PDF, con `pdftotext`; los PDF escaneados y las imágenes, con OCR local mediante `tesseract` si está instalado), así que también se encuentran al buscar.
 - **Enlaces con tipo.** `works_at:: [[acme]]` dice qué significa un enlace, y `links` puede filtrar por él.
 - **Búsqueda por significado, opcional.** Apunta `[embeddings]` a cualquier endpoint de embeddings compatible con OpenAI (Ollama o llama.cpp en la misma CPU, TEI, OpenAI…) y `search` combina el texto completo con la similitud de vectores, así que «coche» encuentra la nota que dice «vehículo». Dentro del servidor no corre ningún modelo y no hace falta GPU; sin él, la búsqueda es solo de texto completo.
+- **También tus archivos.** Conecta tu Google Drive y los agentes buscan en él por nombre al instante (un índice en memoria, como FSearch) o por contenido (el índice de texto de Drive), y leen cualquier archivo.
+- **Una carpeta de fuentes que alimenta la memoria.** Deja un documento en la carpeta de Drive que elijas y un agente que tú configuras (Claude, cualquier modelo compatible con OpenAI o un webhook tuyo) lo lee y actualiza las notas, citándolo por su ID de Drive. También sigue las versiones nuevas y los borrados.
+- **Seguir un tema en otro agente.** `resume` da el estado de un tema (qué se está haciendo, qué viene después) y lo que cambió desde tu última visita, en una llamada barata, para dejar un chat y seguir en otro.
+- **Sin servidor.** Las notas en un repositorio privado de GitHub, los archivos en Google Drive y el servidor como una función de Vercel: [docs/deploy-vercel.md](docs/deploy-vercel.md) (en inglés).
 
 Cómo funciona por dentro (índice, flujo de escritura, concurrencia, autenticación): [docs/design.md](docs/design.md).
 
@@ -48,8 +52,12 @@ En Claude Code también puede instalar, si quieres, un hook que le acerca al age
 | `delete` | Borra una nota (queda en el historial); se rechaza mientras otras notas la enlacen |
 | `revert` | Deshace un commit de `recent`/`history` con un commit nuevo, o solo lo que hizo en una nota; conserva los cambios posteriores que no se solapan y si no, se rechaza con `REVERT_CONFLICT` |
 | `attach` | Guarda un archivo en LFS con una nota al lado en la que se puede buscar |
+| `resume` | Retoma un tema: la descripción de su nota, sus secciones de estado enteras (`[resume] sections` en `memory.toml`), los últimos cambios y solo los títulos del resto; `since` para lo que cambió desde tu última visita |
+| `files_search` | Tu Drive (si hay `[drive]`): por nombre desde memoria, al instante, o `content: true` para el índice de texto de Drive |
+| `files_read` | El texto de un archivo (texto, Docs/Hojas/Presentaciones de Google, Word) o el archivo entero (PDF, imágenes…) |
+| `files_info` | Nombre, ruta, tipo, tamaño, fecha y enlace de un archivo por su ID (`source:<id>` en las notas) |
 
-Los clientes con un token de solo lectura ven solo las herramientas de lectura: `list`, `search`, `read`, `links`, `history`, `recent`, `lint` y `clients`.
+Los clientes con un token de solo lectura ven solo las herramientas de lectura: `list`, `search`, `read`, `links`, `history`, `recent`, `resume`, `lint`, `clients` y las `files_*`.
 
 `lint` es la mitad barata de mantener la memoria en orden (la «wiki para LLM» de Karpathy: ingerir, responder, revisar). Sale del índice y de las fechas de git en milisegundos, sin modelo, así que el agente recibe candidatos en vez de leerse todas las notas; juzgarlos (¿es una contradicción?, ¿sigue valiendo esa deducción?, ¿fusionar o enlazar?) es la mitad del agente. Más en [docs/design.md](docs/design.md#lint).
 
@@ -166,6 +174,20 @@ model = "nomic-embed-text"
 # timeout_seconds = 60
 query_prefix = "search_query: "                 # algunos modelos quieren marcadas sus entradas (nomic, e5)
 document_prefix = "search_document: "
+
+[drive]                                         # opcional: tu Google Drive como archivos (el token, en docs/deploy-vercel.md)
+client_id = "…apps.googleusercontent.com"
+client_secret_file = "google-client-secret"
+refresh_token_file = "google-refresh-token"     # permisos drive.readonly (+ drive.appdata para arrancar rápido)
+sources_folder = "Memoria/Fuentes"              # opcional: lo que haya aquí alimenta la memoria
+# check_interval_seconds = 60                   # cada cuánto se miran los cambios de Drive y se ingieren las fuentes
+# push_token_file = "drive-push-token"          # avisos de Drive a <public_url>/hooks/drive
+
+[ingest]                                        # opcional: el agente que lee la carpeta de fuentes
+provider = "anthropic"                          # anthropic | openai (cualquier API compatible) | webhook
+api_key_file = "anthropic-key"
+# model = "claude-opus-5-5"; base_url = "…"; webhook_url = "…"; webhook_secret_file = "…"
+# max_files_per_run = 3; max_steps = 30
 ```
 
 Subidas para `attach`: `curl -T file.pdf -H "Authorization: Bearer $TOKEN" http://host:8782/uploads/file.pdf` devuelve un `upload_id`. No hay límite de tamaño.
