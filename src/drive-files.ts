@@ -1,4 +1,5 @@
 import { gunzipSync, gzipSync } from "node:zlib";
+import { docxText } from "./docx.js";
 import { type DriveClient, DriveError } from "./drive.js";
 import { type Logger, silentLogger } from "./log.js";
 
@@ -41,6 +42,7 @@ const EXPORTS: Record<string, string> = {
 	"application/vnd.google-apps.spreadsheet": "text/csv",
 	"application/vnd.google-apps.presentation": "text/plain",
 };
+const DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 const isText = (mime: string) => mime.startsWith("text/") || /^application\/(json|xml|x-yaml|yaml|csv|x-ndjson|javascript|x-sh)$/.test(mime);
 export const fold = (s: string) => s.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
 
@@ -338,6 +340,12 @@ export class DriveFiles {
 		if (f.size !== null && f.size > maxBytes) throw new DriveError(413, `«${f.name}» is ${(f.size / 1024 / 1024).toFixed(1)} MB; at most ${maxBytes / 1024 / 1024} MB.`);
 		const data = await this.drive.bytes(`/drive/v3/files/${id}`, { alt: "media" });
 		if (!data) throw new DriveError(404, `«${f.name}» could not be downloaded.`);
+		if (f.mimeType === DOCX) {
+			try {
+				const text = docxText(data);
+				return { kind: "text", text: text.slice(0, maxChars), mimeType: "text/plain", truncated: text.length > maxChars };
+			} catch {} // not readable as a Word document: hand it over whole
+		}
 		return { kind: "binary", data, mimeType: f.mimeType, name: f.name };
 	}
 

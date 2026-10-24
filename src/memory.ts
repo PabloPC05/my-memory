@@ -114,6 +114,12 @@ export interface RecentCommit {
 	notes: { path: string; name?: string; change: "added" | "modified" | "deleted" | "moved" | "copied"; from?: string }[];
 }
 
+/** Where the server keeps a state file of its own in the notes repo. */
+function stateFile(name: string): string {
+	if (!/^[a-z0-9-]+$/.test(name)) throw new MemoryError("INVALID_ARGUMENT", `Invalid state name «${name}».`);
+	return `.my-memory/${name}.json`;
+}
+
 const CHANGE_NAMES: Record<string, RecentCommit["notes"][number]["change"]> = { A: "added", M: "modified", T: "modified", D: "deleted", R: "moved", C: "copied" };
 
 /**
@@ -200,6 +206,11 @@ export class MemoryService {
 		this.syncTimer.unref();
 	}
 
+	/** Fetches and integrates the remote now, and waits for it (hosts without a long-lived process sync per request). */
+	sync(source = "request"): Promise<void> {
+		return this.lock.run(() => this.syncLocked(source));
+	}
+
 	/** Waits until queued writes and syncs are done (tests and shutdown). */
 	idle(): Promise<void> {
 		return this.lock.run(async () => undefined);
@@ -236,6 +247,8 @@ export class MemoryService {
 
 	/** Reads and parses a file for the index. Async part only: the index itself is then updated synchronously. */
 	private async prepareFile(path: string): Promise<() => void> {
+		// Hidden folders (the server's own state in .my-memory/) are not notes nor assets.
+		if (path.split("/").some((p) => p.startsWith("."))) return () => undefined;
 		if (!path.toLowerCase().endsWith(".md")) return this.isRootFile(path) ? () => undefined : () => this.index.putAsset(path);
 		const content = await readFile(this.abs(path), "utf8");
 		const parsed = parseNote(content, this.conventions);
@@ -979,6 +992,28 @@ export class MemoryService {
 	/** Maintenance worklist from the index (see lint.ts). `nowMs` is for tests. */
 	lint(args: LintArgs = {}, nowMs: number = Date.now()) {
 		return lint(this.index, this.conventions, args, nowMs);
+	}
+
+	// ── the server's own state ───────────────────────────────────────────────
+
+	/** A state file of the server in the notes repo (`.my-memory/<name>.json`), parsed, or null when there is none. */
+	async readState<T>(name: string): Promise<T | null> {
+		const path = stateFile(name);
+		if (!(await this.exists(path))) return null;
+		return JSON.parse(await this.readText(path)) as T;
+	}
+
+	/**
+	 * Saves a state file of the server as one commit, like any write (so it lives and travels with the notes, which is
+	 * what lets a host without a disk keep it). Not reachable by the tools: they cannot write hidden paths.
+	 */
+	saveState(client: ClientIdentity, name: string, value: unknown, reason: string): Promise<WriteResult> {
+		const path = stateFile(name);
+		return this.mutate(client, "state", reason, async () => {
+			await this.writeText(path, `${JSON.stringify(value, null, 2)}
+`);
+			return { paths: [path], result: { path } };
+		});
 	}
 
 	// ── write tools ──────────────────────────────────────────────────────────
